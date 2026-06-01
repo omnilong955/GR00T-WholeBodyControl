@@ -3,7 +3,7 @@
 # Sets up the .venv_inference venv for running VLA inference with
 # Isaac-GR00T PolicyClient against a remote or local policy server.
 #
-# Installs gear_sonic[inference] which pulls in the Isaac-GR00T library,
+# Installs the local Isaac-GR00T checkout plus gear_sonic[inference], which pulls in
 # PyZMQ, msgpack, Pinocchio, and other inference dependencies.
 #
 # Usage:  bash install_scripts/install_inference.sh   (run from repo root)
@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ISAAC_GROOT_ROOT="$(cd "$REPO_ROOT/../Isaac-GR00T" 2>/dev/null && pwd || true)"
 
 # ── 0. System dependencies ────────────────────────────────────────────────────
 ARCH="$(uname -m)"
@@ -56,6 +57,14 @@ echo "[INFO] Creating .venv_inference with uv-managed Python 3.10 …"
 uv venv .venv_inference --python "$MANAGED_PY" --prompt gear_sonic_inference
 # shellcheck disable=SC1091
 source .venv_inference/bin/activate
+if [ -z "$ISAAC_GROOT_ROOT" ] || [ ! -f "$ISAAC_GROOT_ROOT/pyproject.toml" ]; then
+    echo "[ERROR] Local Isaac-GR00T checkout not found at:"
+    echo "        $REPO_ROOT/../Isaac-GR00T"
+    echo "        Clone/install Isaac-GR00T there, then re-run this script."
+    exit 1
+fi
+echo "[INFO] Installing local Isaac-GR00T from $ISAAC_GROOT_ROOT …"
+uv pip install -e "$ISAAC_GROOT_ROOT"
 echo "[INFO] Installing gear_sonic[inference] (this may take a few minutes) …"
 uv pip install -e "gear_sonic[inference]"
 

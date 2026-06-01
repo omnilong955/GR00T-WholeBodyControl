@@ -256,6 +256,11 @@ def prepare_observation_from_sensors(
     }
 
     observation = prepare_observation_for_eval(robot_model, observation)
+    observation["state"]["full_state"] = observation["q"]
+    assert observation["state"]["full_state"].shape[-1] == 43, (
+        "NEW_EMBODIMENT expects state.full_state to have dim 43, got "
+        f"{observation['state']['full_state'].shape[-1]}"
+    )
 
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
@@ -291,6 +296,10 @@ def run_policy_inference_and_process(policy, observation, robot_model):
             return None
 
         processed_action = concat_action(robot_model, action)
+        if "left_hand_joints" not in processed_action and "upper_body_lh" in processed_action:
+            processed_action["left_hand_joints"] = processed_action["upper_body_lh"]
+        if "right_hand_joints" not in processed_action and "upper_body_rh" in processed_action:
+            processed_action["right_hand_joints"] = processed_action["upper_body_rh"]
         return processed_action
     except Exception as e:
         print(f"Error in inference: {e}")
