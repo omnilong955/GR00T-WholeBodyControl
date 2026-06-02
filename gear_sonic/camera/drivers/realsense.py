@@ -1,4 +1,4 @@
-"""Intel RealSense camera driver.
+"""Intel RealSense RGB camera driver.
 
 Requires the ``pyrealsense2`` SDK — install with::
 
@@ -10,6 +10,7 @@ See https://github.com/IntelRealSense/librealsense for hardware-specific instruc
 import time
 from typing import Any
 
+import cv2
 import numpy as np
 
 try:
@@ -28,23 +29,22 @@ from gear_sonic.camera.sensor_server import (
 
 
 class RealSenseConfig:
-    """Configuration for the RealSense camera."""
+    """Configuration for the RealSense color stream."""
 
-    depth_image_dim: tuple[int, int] = (640, 480)
     color_image_dim: tuple[int, int] = (640, 480)
     fps: int = 30
     mount_position: str = CameraMountPosition.EGO_VIEW.value
 
 
 class RealSenseSensor(Sensor, SensorServer):
-    """Sensor for Intel RealSense depth cameras."""
+    """Sensor for a single Intel RealSense color camera."""
 
     def __init__(
         self,
         run_as_server: bool = False,
         port: int = 5555,
         config: RealSenseConfig = RealSenseConfig(),
-        id: int = 0,
+        serial: str | None = None,
         mount_position: str = CameraMountPosition.EGO_VIEW.value,
     ):
         devices = rs.context().query_devices()
@@ -58,8 +58,17 @@ class RealSenseSensor(Sensor, SensorServer):
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-        devices = sorted(devices, key=lambda x: x.get_info(rs.camera_info.serial_number))
-        self.config.enable_device(devices[id].get_info(rs.camera_info.serial_number))
+        serials = [device.get_info(rs.camera_info.serial_number) for device in devices]
+        if not serial:
+            raise RuntimeError(
+                "RealSense serial is required. Pass --left-wrist-device-id and "
+                "--right-wrist-device-id for D405 cameras."
+            )
+        if serial not in serials:
+            raise RuntimeError(
+                f"RealSense serial {serial} not found. Available serials: {serials}"
+            )
+        self.config.enable_device(serial)
 
         try:
             self.config.enable_stream(
@@ -67,13 +76,6 @@ class RealSenseSensor(Sensor, SensorServer):
                 config.color_image_dim[0],
                 config.color_image_dim[1],
                 rs.format.rgb8,
-                config.fps,
-            )
-            self.config.enable_stream(
-                rs.stream.depth,
-                config.depth_image_dim[0],
-                config.depth_image_dim[1],
-                rs.format.z16,
                 config.fps,
             )
             self.pipeline.start(self.config)
@@ -85,10 +87,7 @@ class RealSenseSensor(Sensor, SensorServer):
         self.mount_position = mount_position
         if self._run_as_server:
             self.start_server(port)
-        print(
-            f"Done initializing RealSense sensor: "
-            f"{devices[id].get_info(rs.camera_info.serial_number)}"
-        )
+        print(f"Done initializing RealSense sensor: {serial}")
 
     def read(self) -> dict[str, Any] | None:
         try:
@@ -98,32 +97,29 @@ class RealSenseSensor(Sensor, SensorServer):
             return None
 
         color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
 
-        if not color_frame or not depth_frame:
-            print("WARNING! No color or depth frame")
+        if not color_frame:
+            print("WARNING! No color frame")
             return None
 
         try:
             color_image = np.asanyarray(color_frame.get_data())
-            depth_image = np.asanyarray(depth_frame.get_data())
         except Exception as e:
-            print(f"ERROR! Failed to convert frames to numpy arrays: {e}")
+            print(f"ERROR! Failed to convert color frame to numpy array: {e}")
             return None
 
-        if color_image.size == 0 or depth_image.size == 0:
-            print("WARNING! Empty color or depth image")
+        if color_image.size == 0:
+            print("WARNING! Empty color image")
             return None
 
+        width, height = self._realsense_config.color_image_dim
+        if color_image.shape[1] != width or color_image.shape[0] != height:
+            color_image = cv2.resize(color_image, (width, height), interpolation=cv2.INTER_AREA)
+
+        color_image = np.ascontiguousarray(color_image, dtype=np.uint8)
         current_time = time.time()
-        timestamps = {
-            self.mount_position: current_time,
-            f"{self.mount_position}_depth": current_time,
-        }
-        images = {
-            self.mount_position: color_image,
-            f"{self.mount_position}_depth": depth_image,
-        }
+        timestamps = {self.mount_position: current_time}
+        images = {self.mount_position: color_image}
         return {"timestamps": timestamps, "images": images}
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -144,16 +140,6 @@ class RealSenseSensor(Sensor, SensorServer):
                         3,
                     ),
                     dtype=np.uint8,
-                ),
-                "depth_image": gym.spaces.Box(
-                    low=0,
-                    high=255,
-                    shape=(
-                        self._realsense_config.depth_image_dim[1],
-                        self._realsense_config.depth_image_dim[0],
-                        1,
-                    ),
-                    dtype=np.uint16,
                 ),
             }
         )

@@ -11,7 +11,7 @@ Usage (on robot)::
         --ego-view-device-id 18443010E1ABC12300 \\
         --port 5555
 
-Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
+Supported camera types: ``oak``, ``oak_mono``, ``realsense``, ``zed``,
 ``usb``, or a path to an ``.mp4`` file for replay testing.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
@@ -375,8 +375,15 @@ class ComposedCameraSensor(Sensor, SensorServer):
         elif camera_type == "realsense":
             from gear_sonic.camera.drivers.realsense import RealSenseSensor
 
-            print(f"Initializing RealSense sensor for camera type: {camera_type}")
-            return RealSenseSensor(mount_position=mount_position)
+            print(f"Initializing RealSense sensor for type: {camera_type}, serial: {device_id}")
+            return RealSenseSensor(mount_position=mount_position, serial=device_id)
+
+        elif camera_type == "zed":
+            from gear_sonic.camera.drivers.zed import ZEDConfig, ZEDSensor
+
+            zed_config = ZEDConfig()
+            print(f"Initializing ZED sensor for type: {camera_type}, view: {zed_config.view}")
+            return ZEDSensor(config=zed_config, mount_position=mount_position)
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
