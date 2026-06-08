@@ -182,6 +182,15 @@ class WBCDCompetitionConfig:
             "squat_to_stand_speed_mps": 0.06,
             "allow_recovery_motion": False,
         },
+        "lean": {
+            "enabled": True,
+            "default_pitch_deg": 0.0,
+            "min_pitch_deg": 0.0,
+            "max_pitch_deg": 18.0,
+            "pitch_step_deg": 3.0,
+            "torso_forward_offset_per_deg": 0.003,
+            "torso_down_offset_per_deg": 0.0015,
+        },
         "movement": {
             "joystick_dead_zone": 0.10,
             "stand_manip_max_vx": 0.10,
@@ -198,6 +207,8 @@ class WBCDCompetitionConfig:
             "hold_stand_recovery": "B",
             "height_up": "Y",
             "height_down": "X",
+            "lean_forward": "B",
+            "lean_back": "A",
         },
         "logging": {
             "print_mode_changes": True,
@@ -1859,6 +1870,9 @@ class PlannerStreamer:
         self._prev_wbcd_height_down = False
         self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
         self._kneel_recovery_stage_elapsed = 0.0
+        self.wbcd_lean_pitch_deg = self._cfg_float("lean", "default_pitch_deg", default=0.0)
+        self._prev_wbcd_lean_forward = False
+        self._prev_wbcd_lean_back = False
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -1878,6 +1892,29 @@ class PlannerStreamer:
 
     def is_wbcd_active(self) -> bool:
         return self.wbcd_mode != WBCDCompetitionMode.TRANSPORT
+
+    def _clamp_wbcd_lean(self):
+        min_pitch = self._cfg_float("lean", "min_pitch_deg", default=0.0)
+        max_pitch = self._cfg_float("lean", "max_pitch_deg", default=18.0)
+        self.wbcd_lean_pitch_deg = clamp(self.wbcd_lean_pitch_deg, min_pitch, max_pitch)
+
+    def _reset_wbcd_lean(self):
+        self.wbcd_lean_pitch_deg = self._cfg_float("lean", "default_pitch_deg", default=0.0)
+        self._clamp_wbcd_lean()
+
+    def _wbcd_lean_offsets(self) -> tuple[float, float]:
+        forward_per_deg = self._cfg_float("lean", "torso_forward_offset_per_deg", default=0.003)
+        down_per_deg = self._cfg_float("lean", "torso_down_offset_per_deg", default=0.0015)
+        return forward_per_deg * self.wbcd_lean_pitch_deg, down_per_deg * self.wbcd_lean_pitch_deg
+
+    def _print_wbcd_lean_state(self):
+        forward_offset, down_offset = self._wbcd_lean_offsets()
+        print(
+            "[WBCD] Lean pitch -> "
+            f"{self.wbcd_lean_pitch_deg:.1f} deg, "
+            f"torso_forward=+{forward_offset:.3f} m, "
+            f"torso_down=-{down_offset:.3f} m"
+        )
 
     def prepare_wbcd_vr3pt_entry(self, mode: WBCDCompetitionMode) -> bool:
         sample = self.reader.get_latest()
@@ -1905,6 +1942,8 @@ class PlannerStreamer:
     def enter_wbcd_mode(self, mode: WBCDCompetitionMode):
         self._prev_wbcd_height_up = False
         self._prev_wbcd_height_down = False
+        self._prev_wbcd_lean_forward = False
+        self._prev_wbcd_lean_back = False
         if mode != WBCDCompetitionMode.STAND_RECOVERY:
             self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
             self._kneel_recovery_stage_elapsed = 0.0
@@ -1948,8 +1987,11 @@ class PlannerStreamer:
             self._wbcd_entry_hold_until = 0.0
             self._prev_wbcd_height_up = False
             self._prev_wbcd_height_down = False
+            self._prev_wbcd_lean_forward = False
+            self._prev_wbcd_lean_back = False
             self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
             self._kneel_recovery_stage_elapsed = 0.0
+            self._reset_wbcd_lean()
             if self._cfg_bool("logging", "print_mode_changes", default=True):
                 print("[WBCD] Mode -> TRANSPORT")
 
@@ -2036,6 +2078,17 @@ class PlannerStreamer:
 
         print("[PlannerLoop] Sending VR 3-point pose as target")
         vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+        if self._cfg_bool("lean", "enabled", default=True):
+            self._clamp_wbcd_lean()
+            pitch_deg = self.wbcd_lean_pitch_deg
+            if abs(pitch_deg) > 1e-6:
+                torso_idx = 2
+                forward_offset, down_offset = self._wbcd_lean_offsets()
+                vr_3pt_pose[torso_idx, 0] += forward_offset
+                vr_3pt_pose[torso_idx, 2] -= down_offset
+                torso_rot = sRot.from_quat(vr_3pt_pose[torso_idx, 3:], scalar_first=True)
+                lean_rot = sRot.from_euler("y", -pitch_deg, degrees=True)
+                vr_3pt_pose[torso_idx, 3:] = (lean_rot * torso_rot).as_quat(scalar_first=True)
         vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
         vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
@@ -2061,6 +2114,38 @@ class PlannerStreamer:
     def _run_wbcd_once(self, a_pressed: bool, b_pressed: bool, x_pressed: bool, y_pressed: bool):
         self.wbcd_config.reload_if_needed()
         left_menu_button, _, _, _, _ = get_controller_inputs()
+        if self._cfg_bool("lean", "enabled", default=True):
+            lean_forward_now = (
+                not left_menu_button
+                and _face_button_pressed(
+                    self.wbcd_config.get_str("buttons", "lean_forward", default="B"),
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                )
+            )
+            lean_back_now = (
+                not left_menu_button
+                and _face_button_pressed(
+                    self.wbcd_config.get_str("buttons", "lean_back", default="A"),
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                )
+            )
+            step = self._cfg_float("lean", "pitch_step_deg", default=3.0)
+            if lean_forward_now and not self._prev_wbcd_lean_forward:
+                self.wbcd_lean_pitch_deg += step
+                self._clamp_wbcd_lean()
+                self._print_wbcd_lean_state()
+            if lean_back_now and not self._prev_wbcd_lean_back:
+                self.wbcd_lean_pitch_deg -= step
+                self._clamp_wbcd_lean()
+                self._print_wbcd_lean_state()
+            self._prev_wbcd_lean_forward = lean_forward_now
+            self._prev_wbcd_lean_back = lean_back_now
 
         mode_to_send = LocomotionMode.IDLE
         height = -1.0
@@ -2237,6 +2322,8 @@ class PlannerStreamer:
             print(
                 "[WBCD] VR targets "
                 f"L={vr_3pt_position[0:3]}, R={vr_3pt_position[3:6]}, "
+                f"T={vr_3pt_position[6:9]}, "
+                f"lean={self.wbcd_lean_pitch_deg:.1f} deg, "
                 f"height={height:.3f}, mode={mode_to_send.name}"
             )
 

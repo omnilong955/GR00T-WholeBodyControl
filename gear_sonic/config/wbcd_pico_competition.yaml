@@ -17,7 +17,7 @@ height:
   half_squat_max: 0.62
 
   # Low-shelf static kneel manipulation. Enter only after HALF_SQUAT_MANIP.
-  kneel_default: 0.50
+  kneel_default: 0.3
   kneel_min: 0.30
   kneel_max: 0.70
   kneel_adjust_step_m: 0.02
@@ -57,6 +57,16 @@ recovery:
   # Keep false for first real-robot tests to avoid forward motion near shelves.
   allow_recovery_motion: false
 
+lean:
+  # Virtual lean changes the VR_3PT torso/neck target, not the waist joints directly.
+  enabled: true
+  default_pitch_deg: 0.0
+  min_pitch_deg: 0.0
+  max_pitch_deg: 18.0
+  pitch_step_deg: 3.0
+  torso_forward_offset_per_deg: 0.008
+  torso_down_offset_per_deg: 0.003
+
 movement:
   # Joystick dead zone used only in WBCD manipulation/recovery modes.
   joystick_dead_zone: 0.10
@@ -85,6 +95,8 @@ buttons:
   # KNEEL_MANIP: press once to adjust one step.
   height_up: Y
   height_down: X
+  lean_forward: B
+  lean_back: A
 
 logging:
   print_mode_changes: true

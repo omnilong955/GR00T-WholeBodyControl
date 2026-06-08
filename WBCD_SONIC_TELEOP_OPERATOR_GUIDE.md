@@ -71,6 +71,8 @@ gear_sonic/config/wbcd_pico_competition.yaml
 | 半蹲降低 | `X` | 仅在 `HALF_SQUAT_MANIP` 且不按 `left_menu` 时生效 |
 | 跪姿升高 | `Y` | 仅在 `KNEEL_MANIP` 且不按 `left_menu` 时生效；每按一次升高一档 |
 | 跪姿降低 | `X` | 仅在 `KNEEL_MANIP` 且不按 `left_menu` 时生效；每按一次降低一档 |
+| 增加虚拟俯身 | `B` | 仅在 WBCD 模式且不按 `left_menu` 时生效；每按一次增加一档 |
+| 减少虚拟俯身 | `A` | 仅在 WBCD 模式且不按 `left_menu` 时生效；每按一次减少一档 |
 | 缓慢恢复站立 | 按住 `left_menu + B` | 半蹲/站姿普通恢复；跪姿分阶段恢复；松开暂停 |
 | 从 WBCD 回全身 POSE | `A+X` 或 `B+Y` | 退出 WBCD 抓取模式，回到 `POSE/TRANSPORT` |
 | 急停 | `A+B+X+Y` | 任意模式下停止 |
@@ -148,7 +150,7 @@ height:
   half_squat_default: 0.55
   half_squat_min: 0.45
   half_squat_max: 0.62
-  kneel_default: 0.50
+  kneel_default: 0.30
   kneel_min: 0.30
   kneel_max: 0.70
   kneel_adjust_step_m: 0.02
@@ -176,6 +178,15 @@ recovery:
   squat_hold_sec: 0.50
   squat_to_stand_speed_mps: 0.06
   allow_recovery_motion: false
+
+lean:
+  enabled: true
+  default_pitch_deg: 0.0
+  min_pitch_deg: 0.0
+  max_pitch_deg: 18.0
+  pitch_step_deg: 3.0
+  torso_forward_offset_per_deg: 0.003
+  torso_down_offset_per_deg: 0.0015
 ```
 
 调整建议：
@@ -186,6 +197,8 @@ recovery:
 | 半蹲太低或不稳 | 提高 `half_squat_default` 或 `half_squat_min` |
 | 跪姿太低或不稳 | 提高 `kneel_default` 或 `kneel_min` |
 | 跪姿单次调整太大/太小 | 调整 `kneel_adjust_step_m` |
+| 虚拟俯身不明显 | 提高 `pitch_step_deg` 或 `torso_forward_offset_per_deg` |
+| 虚拟俯身不稳 | 降低 `max_pitch_deg` 或 `pitch_step_deg` |
 | 进入半蹲太快 | 降低 `squat_enter_speed_mps` 或增加 `hold_before_squat_sec` |
 | 按抓取模式无反应 | 检查终端是否提示缺少 robot feedback |
 | 站起太快 | 降低 `stand_recovery_speed_mps` |
@@ -199,6 +212,7 @@ recovery:
 
 - 从 `POSE/TRANSPORT` 进入 `STAND_MANIP` 或 `HALF_SQUAT_MANIP` 时，WBCD 会用机器人当前实测手臂姿态做连续标定；如果没有 deploy feedback，默认不会进入抓取模式。
 - 在 WBCD 抓取模式内部切换 `STAND_MANIP`、`HALF_SQUAT_MANIP` 或 `KNEEL_MANIP` 时，不重新做全局零姿态标定；切换前先把操作者双手放到安全位置。
+- 虚拟俯身是修改 VR_3PT 的 torso/neck 目标，不是直接控制腰关节；效果取决于策略对第三个 VR 点的响应。
 - `HALF_SQUAT_MANIP` 使用 deploy 端的 `IDLE_SQUAT`，该模式在当前 Sonic deploy 里属于 static mode，因此不保证半蹲状态下移动。
 - `KNEEL_MANIP` 使用双膝跪姿 static mode，默认不移动；从 `POSE/TRANSPORT` 直接进入跪姿被禁止。
 - 如果 WBCD 模式下操作异常，优先按 `A+X` 回到 `POSE/TRANSPORT`；紧急情况按 `A+B+X+Y`。
