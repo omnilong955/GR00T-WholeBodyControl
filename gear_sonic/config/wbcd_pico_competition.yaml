@@ -28,6 +28,20 @@ height:
   stand_recovery_target: 0.74
   stand_recovery_speed_mps: 0.10
 
+entry:
+  # Require deploy feedback before entering WBCD manipulation modes.
+  # This lets the VR_3PT mapping start from the robot's current arm pose.
+  require_robot_feedback: true
+
+  # After entering HALF_SQUAT_MANIP, hold standing height briefly before lowering.
+  hold_before_squat_sec: 0.30
+
+  # Speed used to lower from standing height into half squat.
+  squat_enter_speed_mps: 0.08
+
+  # Print per-frame VR target positions for debugging only.
+  print_vr_target_debug: false
+
 movement:
   # Joystick dead zone used only in WBCD manipulation/recovery modes.
   joystick_dead_zone: 0.10

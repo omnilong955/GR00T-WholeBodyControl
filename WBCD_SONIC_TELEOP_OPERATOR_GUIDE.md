@@ -99,11 +99,12 @@ gear_sonic/config/wbcd_pico_competition.yaml
 中层物体：
 
 1. 在货架前保持身体稳定。
-2. 按 `left_menu + X` 进入 `HALF_SQUAT_MANIP`。
-3. 如高度不合适：
+2. 先把双手放到安全位置，再按 `left_menu + X` 进入 `HALF_SQUAT_MANIP`。
+3. 程序会用机器人当前实测手臂姿态做一次连续标定，随后短暂保持站姿，再缓慢进入半蹲。
+4. 如高度不合适：
    - 按住 `Y` 升高。
    - 按住 `X` 降低。
-4. 用 VR_3PT 控制双臂和双手抓取。
+5. 用 VR_3PT 控制双臂和双手抓取。
 
 下层物体：
 
@@ -155,6 +156,12 @@ movement:
   stand_manip_max_wz: 0.25
   stand_recovery_max_vx: 0.08
   stand_recovery_max_wz: 0.25
+
+entry:
+  require_robot_feedback: true
+  hold_before_squat_sec: 0.30
+  squat_enter_speed_mps: 0.08
+  print_vr_target_debug: false
 ```
 
 调整建议：
@@ -164,6 +171,8 @@ movement:
 | 半蹲太高 | 降低 `half_squat_default` |
 | 半蹲太低或不稳 | 提高 `half_squat_default` 或 `half_squat_min` |
 | 跪姿太低或不稳 | 提高 `kneel_default` 或 `kneel_min` |
+| 进入半蹲太快 | 降低 `squat_enter_speed_mps` 或增加 `hold_before_squat_sec` |
+| 按抓取模式无反应 | 检查终端是否提示缺少 robot feedback |
 | 站起太快 | 降低 `stand_recovery_speed_mps` |
 | 站起太慢 | 提高 `stand_recovery_speed_mps` |
 | 站姿抓取移动太快 | 降低 `stand_manip_max_vx` |
@@ -171,7 +180,8 @@ movement:
 
 ## 6. 注意事项
 
-- 进入 `STAND_MANIP`、`HALF_SQUAT_MANIP` 或 `KNEEL_MANIP` 时，WBCD 流程不会重新执行 VR_3PT 校准；切换前先把操作者双手放到安全位置，机器人上半身会继续跟随当前手位。
+- 从 `POSE/TRANSPORT` 进入 `STAND_MANIP` 或 `HALF_SQUAT_MANIP` 时，WBCD 会用机器人当前实测手臂姿态做连续标定；如果没有 deploy feedback，默认不会进入抓取模式。
+- 在 WBCD 抓取模式内部切换 `STAND_MANIP`、`HALF_SQUAT_MANIP` 或 `KNEEL_MANIP` 时，不重新做全局零姿态标定；切换前先把操作者双手放到安全位置。
 - `HALF_SQUAT_MANIP` 使用 deploy 端的 `IDLE_SQUAT`，该模式在当前 Sonic deploy 里属于 static mode，因此不保证半蹲状态下移动。
 - `KNEEL_MANIP` 使用双膝跪姿 static mode，默认不移动；从 `POSE/TRANSPORT` 直接进入跪姿被禁止。
 - 如果 WBCD 模式下操作异常，优先按 `A+X` 回到 `POSE/TRANSPORT`；紧急情况按 `A+B+X+Y`。

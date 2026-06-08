@@ -158,6 +158,12 @@ class WBCDCompetitionConfig:
             "stand_recovery_target": 0.74,
             "stand_recovery_speed_mps": 0.10,
         },
+        "entry": {
+            "require_robot_feedback": True,
+            "hold_before_squat_sec": 0.30,
+            "squat_enter_speed_mps": 0.08,
+            "print_vr_target_debug": False,
+        },
         "movement": {
             "joystick_dead_zone": 0.10,
             "stand_manip_max_vx": 0.10,
@@ -1175,6 +1181,34 @@ class ThreePointPose:
             traceback.print_exc()
             return False
 
+    def calibrate_with_measured_q_now(
+        self,
+        body_poses_np: np.ndarray,
+        body_q_measured: np.ndarray,
+    ) -> bool:
+        """Calibrate wrist offsets against the robot's current measured pose.
+
+        WBCD manipulation mode uses this to make the operator's current safe
+        hand pose map to the robot's current hand pose before switching to
+        VR_3PT control.
+        """
+        try:
+            vr_3pt_pose_raw = _process_3pt_pose(body_poses_np)
+            self._calibration_lwrist_offset = None
+            self._calibration_rwrist_offset = None
+            self._calibration_lwrist_rot_offset = None
+            self._calibration_rwrist_rot_offset = None
+            self._override_robot_q = body_q_measured.copy()
+            self._capture_calibration(vr_3pt_pose_raw)
+            print(f"[{self.log_prefix}] WBCD continuous VR 3PT calibration completed")
+            return True
+        except Exception as e:
+            print(f"[{self.log_prefix}] WBCD continuous calibration failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     def _capture_calibration(self, vr_3pt_pose: np.ndarray) -> None:
         """Capture calibration offsets from vr_3pt_pose against G1 FK reference.
         If neck calibration already exists (e.g. from calibrate_now), it is preserved
@@ -1801,6 +1835,8 @@ class PlannerStreamer:
         self.wbcd_height = self._cfg_float("height", "half_squat_default", default=0.55)
         self.wbcd_recovery_hold = False
         self._wbcd_return_to_pose = False
+        self._wbcd_entry_hold_until = 0.0
+        self._wbcd_squat_target_height = self.wbcd_height
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -1821,24 +1857,57 @@ class PlannerStreamer:
     def is_wbcd_active(self) -> bool:
         return self.wbcd_mode != WBCDCompetitionMode.TRANSPORT
 
+    def prepare_wbcd_vr3pt_entry(self, mode: WBCDCompetitionMode) -> bool:
+        sample = self.reader.get_latest()
+        if sample is None:
+            print(f"[WBCD] Cannot enter {mode.name}: no Pico SMPL sample")
+            return False
+
+        self.feedback_reader.poll_feedback()
+        if self.feedback_reader.full_body_q_measured is None:
+            if self._cfg_bool("entry", "require_robot_feedback", default=True):
+                print(f"[WBCD] Cannot enter {mode.name}: no robot feedback full_body_q_measured")
+                return False
+            print(f"[WBCD] Entering {mode.name} without robot feedback; continuous calibration skipped")
+            return True
+
+        ok = self.three_point.calibrate_with_measured_q_now(
+            sample["body_poses_np"],
+            self.feedback_reader.full_body_q_measured,
+        )
+        if not ok:
+            print(f"[WBCD] Cannot enter {mode.name}: continuous VR 3PT calibration failed")
+            return False
+        return True
+
     def enter_wbcd_mode(self, mode: WBCDCompetitionMode):
         if mode == WBCDCompetitionMode.HALF_SQUAT_MANIP:
             default_height = self._cfg_float("height", "half_squat_default", default=0.55)
             min_height = self._cfg_float("height", "half_squat_min", default=0.45)
             max_height = self._cfg_float("height", "half_squat_max", default=0.62)
-            self.wbcd_height = clamp(default_height, min_height, max_height)
+            self._wbcd_squat_target_height = clamp(default_height, min_height, max_height)
+            if self.wbcd_mode == WBCDCompetitionMode.TRANSPORT:
+                hold_sec = self._cfg_float("entry", "hold_before_squat_sec", default=0.30)
+                self._wbcd_entry_hold_until = time.time() + max(0.0, hold_sec)
+                self.wbcd_height = self._cfg_float("height", "stand_recovery_target", default=0.74)
+            else:
+                self._wbcd_entry_hold_until = 0.0
+                self.wbcd_height = self._wbcd_squat_target_height
         elif mode == WBCDCompetitionMode.KNEEL_MANIP:
             default_height = self._cfg_float("height", "kneel_default", default=0.50)
             min_height = self._cfg_float("height", "kneel_min", default=0.30)
             max_height = self._cfg_float("height", "kneel_max", default=0.70)
             self.wbcd_height = clamp(default_height, min_height, max_height)
+            self._wbcd_entry_hold_until = 0.0
         elif mode == WBCDCompetitionMode.STAND_MANIP:
             self.wbcd_height = self._cfg_float("height", "stand_manip", default=-1.0)
+            self._wbcd_entry_hold_until = 0.0
         elif mode == WBCDCompetitionMode.STAND_RECOVERY:
             if self.wbcd_mode == WBCDCompetitionMode.STAND_MANIP:
                 self.wbcd_height = self._cfg_float("height", "stand_recovery_target", default=0.74)
             elif self.wbcd_height < 0.0:
                 self.wbcd_height = self._cfg_float("height", "half_squat_default", default=0.55)
+            self._wbcd_entry_hold_until = 0.0
         self.wbcd_mode = mode
         self._wbcd_return_to_pose = False
         if self._cfg_bool("logging", "print_mode_changes", default=True):
@@ -1849,6 +1918,7 @@ class PlannerStreamer:
             self.wbcd_mode = WBCDCompetitionMode.TRANSPORT
             self.wbcd_recovery_hold = False
             self._wbcd_return_to_pose = False
+            self._wbcd_entry_hold_until = 0.0
             if self._cfg_bool("logging", "print_mode_changes", default=True):
                 print("[WBCD] Mode -> TRANSPORT")
 
@@ -1961,7 +2031,13 @@ class PlannerStreamer:
             movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
 
         elif self.wbcd_mode == WBCDCompetitionMode.HALF_SQUAT_MANIP:
-            if not left_menu_button:
+            min_height = self._cfg_float("height", "half_squat_min", default=0.45)
+            max_height = self._cfg_float("height", "half_squat_max", default=0.62)
+            entry_hold_active = time.time() < self._wbcd_entry_hold_until
+            entry_lowering_active = (
+                not entry_hold_active and self.wbcd_height > self._wbcd_squat_target_height
+            )
+            if not left_menu_button and not entry_hold_active and not entry_lowering_active:
                 adjust_speed = self._cfg_float("height", "adjust_speed_mps", default=0.06)
                 if _face_button_pressed(
                     self.wbcd_config.get_str("buttons", "height_up", default="Y"),
@@ -1979,9 +2055,16 @@ class PlannerStreamer:
                     y_pressed,
                 ):
                     self.wbcd_height -= adjust_speed * self.dt
-            min_height = self._cfg_float("height", "half_squat_min", default=0.45)
-            max_height = self._cfg_float("height", "half_squat_max", default=0.62)
-            self.wbcd_height = clamp(self.wbcd_height, min_height, max_height)
+            if entry_hold_active:
+                self.wbcd_height = self._cfg_float("height", "stand_recovery_target", default=0.74)
+            elif entry_lowering_active:
+                enter_speed = self._cfg_float("entry", "squat_enter_speed_mps", default=0.08)
+                self.wbcd_height = max(
+                    self._wbcd_squat_target_height,
+                    self.wbcd_height - max(0.0, enter_speed) * self.dt,
+                )
+            else:
+                self.wbcd_height = clamp(self.wbcd_height, min_height, max_height)
             height = self.wbcd_height
             mode_to_send = LocomotionMode.IDLE_SQUAT
 
@@ -2015,6 +2098,12 @@ class PlannerStreamer:
             left_hand_position,
             right_hand_position,
         ) = vr_targets
+        if self._cfg_bool("entry", "print_vr_target_debug", default=False):
+            print(
+                "[WBCD] VR targets "
+                f"L={vr_3pt_position[0:3]}, R={vr_3pt_position[3:6]}, "
+                f"height={height:.3f}, mode={mode_to_send.name}"
+            )
 
         msg = build_planner_message(
             mode_to_send.value,
@@ -2444,11 +2533,15 @@ def run_pico_manager(
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
                 elif wbcd_stand_pressed and not prev_wbcd_stand:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-                    planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_MANIP)
+                    if planner_streamer.prepare_wbcd_vr3pt_entry(WBCDCompetitionMode.STAND_MANIP):
+                        new_mode = StreamMode.PLANNER_VR_3PT
+                        planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_MANIP)
                 elif wbcd_half_squat_pressed and not prev_wbcd_half_squat:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-                    planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
+                    if planner_streamer.prepare_wbcd_vr3pt_entry(
+                        WBCDCompetitionMode.HALF_SQUAT_MANIP
+                    ):
+                        new_mode = StreamMode.PLANNER_VR_3PT
+                        planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
                 elif wbcd_kneel_pressed and not prev_wbcd_kneel:
                     print("[WBCD] Enter HALF_SQUAT_MANIP before KNEEL_MANIP")
                 elif ax_pressed and not prev_ax_pressed:
