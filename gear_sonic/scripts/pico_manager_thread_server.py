@@ -154,6 +154,7 @@ class WBCDCompetitionConfig:
             "kneel_default": 0.50,
             "kneel_min": 0.30,
             "kneel_max": 0.70,
+            "kneel_adjust_step_m": 0.02,
             "adjust_speed_mps": 0.06,
             "stand_recovery_target": 0.74,
             "stand_recovery_speed_mps": 0.10,
@@ -1837,6 +1838,8 @@ class PlannerStreamer:
         self._wbcd_return_to_pose = False
         self._wbcd_entry_hold_until = 0.0
         self._wbcd_squat_target_height = self.wbcd_height
+        self._prev_wbcd_height_up = False
+        self._prev_wbcd_height_down = False
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -1881,6 +1884,8 @@ class PlannerStreamer:
         return True
 
     def enter_wbcd_mode(self, mode: WBCDCompetitionMode):
+        self._prev_wbcd_height_up = False
+        self._prev_wbcd_height_down = False
         if mode == WBCDCompetitionMode.HALF_SQUAT_MANIP:
             default_height = self._cfg_float("height", "half_squat_default", default=0.55)
             min_height = self._cfg_float("height", "half_squat_min", default=0.45)
@@ -1919,6 +1924,8 @@ class PlannerStreamer:
             self.wbcd_recovery_hold = False
             self._wbcd_return_to_pose = False
             self._wbcd_entry_hold_until = 0.0
+            self._prev_wbcd_height_up = False
+            self._prev_wbcd_height_down = False
             if self._cfg_bool("logging", "print_mode_changes", default=True):
                 print("[WBCD] Mode -> TRANSPORT")
 
@@ -2071,6 +2078,33 @@ class PlannerStreamer:
         elif self.wbcd_mode == WBCDCompetitionMode.KNEEL_MANIP:
             min_height = self._cfg_float("height", "kneel_min", default=0.30)
             max_height = self._cfg_float("height", "kneel_max", default=0.70)
+            height_up_now = (
+                not left_menu_button
+                and _face_button_pressed(
+                    self.wbcd_config.get_str("buttons", "height_up", default="Y"),
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                )
+            )
+            height_down_now = (
+                not left_menu_button
+                and _face_button_pressed(
+                    self.wbcd_config.get_str("buttons", "height_down", default="X"),
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                )
+            )
+            step = self._cfg_float("height", "kneel_adjust_step_m", default=0.02)
+            if height_up_now and not self._prev_wbcd_height_up:
+                self.wbcd_height += step
+            if height_down_now and not self._prev_wbcd_height_down:
+                self.wbcd_height -= step
+            self._prev_wbcd_height_up = height_up_now
+            self._prev_wbcd_height_down = height_down_now
             self.wbcd_height = clamp(self.wbcd_height, min_height, max_height)
             height = self.wbcd_height
             mode_to_send = LocomotionMode.IDLE_KNEEL_TWO_LEGS

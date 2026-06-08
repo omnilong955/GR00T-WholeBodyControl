@@ -69,6 +69,8 @@ gear_sonic/config/wbcd_pico_competition.yaml
 | 进入跪姿抓取 | `left_menu + Y` | 只能先进入 WBCD 抓取模式；推荐 `HALF_SQUAT_MANIP` 后再进入 |
 | 半蹲升高 | `Y` | 仅在 `HALF_SQUAT_MANIP` 且不按 `left_menu` 时生效 |
 | 半蹲降低 | `X` | 仅在 `HALF_SQUAT_MANIP` 且不按 `left_menu` 时生效 |
+| 跪姿升高 | `Y` | 仅在 `KNEEL_MANIP` 且不按 `left_menu` 时生效；每按一次升高一档 |
+| 跪姿降低 | `X` | 仅在 `KNEEL_MANIP` 且不按 `left_menu` 时生效；每按一次降低一档 |
 | 缓慢恢复站立 | 按住 `left_menu + B` | 进入/保持 `STAND_RECOVERY`，松开暂停 |
 | 从 WBCD 回全身 POSE | `A+X` 或 `B+Y` | 退出 WBCD 抓取模式，回到 `POSE/TRANSPORT` |
 | 急停 | `A+B+X+Y` | 任意模式下停止 |
@@ -147,6 +149,7 @@ height:
   kneel_default: 0.50
   kneel_min: 0.30
   kneel_max: 0.70
+  kneel_adjust_step_m: 0.02
   adjust_speed_mps: 0.06
   stand_recovery_target: 0.74
   stand_recovery_speed_mps: 0.10
@@ -171,6 +174,7 @@ entry:
 | 半蹲太高 | 降低 `half_squat_default` |
 | 半蹲太低或不稳 | 提高 `half_squat_default` 或 `half_squat_min` |
 | 跪姿太低或不稳 | 提高 `kneel_default` 或 `kneel_min` |
+| 跪姿单次调整太大/太小 | 调整 `kneel_adjust_step_m` |
 | 进入半蹲太快 | 降低 `squat_enter_speed_mps` 或增加 `hold_before_squat_sec` |
 | 按抓取模式无反应 | 检查终端是否提示缺少 robot feedback |
 | 站起太快 | 降低 `stand_recovery_speed_mps` |

@@ -20,8 +20,10 @@ height:
   kneel_default: 0.50
   kneel_min: 0.30
   kneel_max: 0.70
+  kneel_adjust_step_m: 0.02
 
   # Height changes while holding Y/X in HALF_SQUAT_MANIP.
+  # In KNEEL_MANIP, the same keys step height once per press by kneel_adjust_step_m.
   adjust_speed_mps: 0.06
 
   # Hold left_menu+B to rise toward this height. Release B to pause.
@@ -65,7 +67,9 @@ buttons:
   kneel_manip: Y
   hold_stand_recovery: B
 
-  # Height adjustment only applies in HALF_SQUAT_MANIP when left_menu is not held.
+  # Height adjustment only applies when left_menu is not held.
+  # HALF_SQUAT_MANIP: hold to adjust continuously.
+  # KNEEL_MANIP: press once to adjust one step.
   height_up: Y
   height_down: X
 
