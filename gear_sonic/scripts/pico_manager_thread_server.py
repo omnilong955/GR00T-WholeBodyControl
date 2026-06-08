@@ -140,6 +140,14 @@ class WBCDCompetitionMode(Enum):
     KNEEL_MANIP = 4
 
 
+class WBCDKneelRecoveryStage(Enum):
+    NONE = 0
+    KNEEL_HOLD = 1
+    ONE_KNEEL_HOLD = 2
+    SQUAT_HOLD = 3
+    SQUAT_TO_STAND = 4
+
+
 class WBCDCompetitionConfig:
     """Small hot-reloadable YAML config for competition-only Pico controls."""
 
@@ -164,6 +172,15 @@ class WBCDCompetitionConfig:
             "hold_before_squat_sec": 0.30,
             "squat_enter_speed_mps": 0.08,
             "print_vr_target_debug": False,
+        },
+        "recovery": {
+            "kneel_hold_sec": 0.30,
+            "one_kneel_height": 0.50,
+            "one_kneel_hold_sec": 0.60,
+            "squat_recovery_height": 0.58,
+            "squat_hold_sec": 0.50,
+            "squat_to_stand_speed_mps": 0.06,
+            "allow_recovery_motion": False,
         },
         "movement": {
             "joystick_dead_zone": 0.10,
@@ -1840,6 +1857,8 @@ class PlannerStreamer:
         self._wbcd_squat_target_height = self.wbcd_height
         self._prev_wbcd_height_up = False
         self._prev_wbcd_height_down = False
+        self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
+        self._kneel_recovery_stage_elapsed = 0.0
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -1886,6 +1905,9 @@ class PlannerStreamer:
     def enter_wbcd_mode(self, mode: WBCDCompetitionMode):
         self._prev_wbcd_height_up = False
         self._prev_wbcd_height_down = False
+        if mode != WBCDCompetitionMode.STAND_RECOVERY:
+            self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
+            self._kneel_recovery_stage_elapsed = 0.0
         if mode == WBCDCompetitionMode.HALF_SQUAT_MANIP:
             default_height = self._cfg_float("height", "half_squat_default", default=0.55)
             min_height = self._cfg_float("height", "half_squat_min", default=0.45)
@@ -1926,11 +1948,26 @@ class PlannerStreamer:
             self._wbcd_entry_hold_until = 0.0
             self._prev_wbcd_height_up = False
             self._prev_wbcd_height_down = False
+            self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
+            self._kneel_recovery_stage_elapsed = 0.0
             if self._cfg_bool("logging", "print_mode_changes", default=True):
                 print("[WBCD] Mode -> TRANSPORT")
 
     def set_wbcd_recovery_hold(self, held: bool):
         self.wbcd_recovery_hold = bool(held)
+
+    def start_kneel_recovery(self):
+        self.wbcd_mode = WBCDCompetitionMode.STAND_RECOVERY
+        self.wbcd_recovery_hold = True
+        self._wbcd_return_to_pose = False
+        self._wbcd_entry_hold_until = 0.0
+        self._kneel_recovery_stage = WBCDKneelRecoveryStage.KNEEL_HOLD
+        self._kneel_recovery_stage_elapsed = 0.0
+        if self._cfg_bool("logging", "print_mode_changes", default=True):
+            print(
+                "[WBCD] Mode -> STAND_RECOVERY, "
+                f"kneel_stage={self._kneel_recovery_stage.name}, height={self.wbcd_height:.3f}"
+            )
 
     def consume_wbcd_return_to_pose(self) -> bool:
         value = self._wbcd_return_to_pose
@@ -2113,15 +2150,79 @@ class PlannerStreamer:
 
         elif self.wbcd_mode == WBCDCompetitionMode.STAND_RECOVERY:
             target = self._cfg_float("height", "stand_recovery_target", default=0.74)
-            if self.wbcd_recovery_hold:
-                rise_speed = self._cfg_float("height", "stand_recovery_speed_mps", default=0.10)
-                self.wbcd_height = min(target, self.wbcd_height + rise_speed * self.dt)
-                if self.wbcd_height >= target - 1e-4:
-                    self._wbcd_return_to_pose = True
-            height = self.wbcd_height
-            max_vx = self._cfg_float("movement", "stand_recovery_max_vx", default=0.08)
-            max_wz = self._cfg_float("movement", "stand_recovery_max_wz", default=0.25)
-            movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
+            if self._kneel_recovery_stage != WBCDKneelRecoveryStage.NONE:
+                if self.wbcd_recovery_hold:
+                    self._kneel_recovery_stage_elapsed += self.dt
+                    if (
+                        self._kneel_recovery_stage == WBCDKneelRecoveryStage.KNEEL_HOLD
+                        and self._kneel_recovery_stage_elapsed
+                        >= self._cfg_float("recovery", "kneel_hold_sec", default=0.30)
+                    ):
+                        self._kneel_recovery_stage = WBCDKneelRecoveryStage.ONE_KNEEL_HOLD
+                        self._kneel_recovery_stage_elapsed = 0.0
+                        self.wbcd_height = self._cfg_float(
+                            "recovery", "one_kneel_height", default=0.50
+                        )
+                        print(f"[WBCD] Kneel recovery -> {self._kneel_recovery_stage.name}")
+                    elif (
+                        self._kneel_recovery_stage == WBCDKneelRecoveryStage.ONE_KNEEL_HOLD
+                        and self._kneel_recovery_stage_elapsed
+                        >= self._cfg_float("recovery", "one_kneel_hold_sec", default=0.60)
+                    ):
+                        self._kneel_recovery_stage = WBCDKneelRecoveryStage.SQUAT_HOLD
+                        self._kneel_recovery_stage_elapsed = 0.0
+                        self.wbcd_height = self._cfg_float(
+                            "recovery", "squat_recovery_height", default=0.58
+                        )
+                        print(f"[WBCD] Kneel recovery -> {self._kneel_recovery_stage.name}")
+                    elif (
+                        self._kneel_recovery_stage == WBCDKneelRecoveryStage.SQUAT_HOLD
+                        and self._kneel_recovery_stage_elapsed
+                        >= self._cfg_float("recovery", "squat_hold_sec", default=0.50)
+                    ):
+                        self._kneel_recovery_stage = WBCDKneelRecoveryStage.SQUAT_TO_STAND
+                        self._kneel_recovery_stage_elapsed = 0.0
+                        print(f"[WBCD] Kneel recovery -> {self._kneel_recovery_stage.name}")
+                    elif self._kneel_recovery_stage == WBCDKneelRecoveryStage.SQUAT_TO_STAND:
+                        rise_speed = self._cfg_float(
+                            "recovery", "squat_to_stand_speed_mps", default=0.06
+                        )
+                        self.wbcd_height = min(target, self.wbcd_height + rise_speed * self.dt)
+                        if self.wbcd_height >= target - 1e-4:
+                            self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
+                            self._kneel_recovery_stage_elapsed = 0.0
+                            self._wbcd_return_to_pose = True
+
+                if self._kneel_recovery_stage == WBCDKneelRecoveryStage.KNEEL_HOLD:
+                    mode_to_send = LocomotionMode.IDLE_KNEEL_TWO_LEGS
+                    height = self.wbcd_height
+                elif self._kneel_recovery_stage == WBCDKneelRecoveryStage.ONE_KNEEL_HOLD:
+                    mode_to_send = LocomotionMode.IDLE_KNEEL
+                    height = self.wbcd_height
+                else:
+                    mode_to_send = LocomotionMode.IDLE_SQUAT
+                    height = self.wbcd_height
+
+                movement = [0.0, 0.0, 0.0]
+                speed = -1.0
+                if self._cfg_bool("recovery", "allow_recovery_motion", default=False):
+                    max_vx = self._cfg_float("movement", "stand_recovery_max_vx", default=0.08)
+                    max_wz = self._cfg_float("movement", "stand_recovery_max_wz", default=0.25)
+                    movement, facing, speed, mode_to_send_motion = self._compute_wbcd_movement(
+                        max_vx, max_wz
+                    )
+                    if mode_to_send_motion == LocomotionMode.SLOW_WALK:
+                        movement[0] = min(0.0, movement[0])
+            else:
+                if self.wbcd_recovery_hold:
+                    rise_speed = self._cfg_float("height", "stand_recovery_speed_mps", default=0.10)
+                    self.wbcd_height = min(target, self.wbcd_height + rise_speed * self.dt)
+                    if self.wbcd_height >= target - 1e-4:
+                        self._wbcd_return_to_pose = True
+                height = self.wbcd_height
+                max_vx = self._cfg_float("movement", "stand_recovery_max_vx", default=0.08)
+                max_wz = self._cfg_float("movement", "stand_recovery_max_wz", default=0.25)
+                movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
 
         vr_targets = self._collect_vr3pt_targets()
         if vr_targets is None:
@@ -2469,8 +2570,11 @@ def run_pico_manager(
                         print("[WBCD] Enter HALF_SQUAT_MANIP before KNEEL_MANIP")
                 elif current_wbcd_mode != WBCDCompetitionMode.STAND_RECOVERY:
                     if wbcd_recovery_pressed:
-                        planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_RECOVERY)
-                        planner_streamer.set_wbcd_recovery_hold(True)
+                        if current_wbcd_mode == WBCDCompetitionMode.KNEEL_MANIP:
+                            planner_streamer.start_kneel_recovery()
+                        else:
+                            planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_RECOVERY)
+                            planner_streamer.set_wbcd_recovery_hold(True)
                 else:
                     planner_streamer.set_wbcd_recovery_hold(wbcd_recovery_pressed)
 

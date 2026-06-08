@@ -71,7 +71,7 @@ gear_sonic/config/wbcd_pico_competition.yaml
 | 半蹲降低 | `X` | 仅在 `HALF_SQUAT_MANIP` 且不按 `left_menu` 时生效 |
 | 跪姿升高 | `Y` | 仅在 `KNEEL_MANIP` 且不按 `left_menu` 时生效；每按一次升高一档 |
 | 跪姿降低 | `X` | 仅在 `KNEEL_MANIP` 且不按 `left_menu` 时生效；每按一次降低一档 |
-| 缓慢恢复站立 | 按住 `left_menu + B` | 进入/保持 `STAND_RECOVERY`，松开暂停 |
+| 缓慢恢复站立 | 按住 `left_menu + B` | 半蹲/站姿普通恢复；跪姿分阶段恢复；松开暂停 |
 | 从 WBCD 回全身 POSE | `A+X` 或 `B+Y` | 退出 WBCD 抓取模式，回到 `POSE/TRANSPORT` |
 | 急停 | `A+B+X+Y` | 任意模式下停止 |
 
@@ -121,9 +121,11 @@ gear_sonic/config/wbcd_pico_competition.yaml
 
 1. 抓稳物体后，先尽量把手和物体从货架内部移出。
 2. 如果需要缓慢站起，按住 `left_menu + B`。
-3. 如果发现可能撞货架，松开 `B` 暂停站起。
-4. 视情况调整手臂位置，或退出回 `POSE/TRANSPORT` 后后退。
-5. 完成恢复后，程序会回到 `POSE/TRANSPORT`。
+3. 如果从 `KNEEL_MANIP` 恢复，程序会按“双膝跪保持 -> 单膝跪 -> 半蹲 -> 缓慢站立”执行。
+4. 如果发现可能撞货架，松开 `B` 暂停站起。
+5. 再次按住 `left_menu + B` 会从当前阶段继续恢复。
+6. 首次测试跪姿恢复时，务必远离货架确认单膝跪阶段稳定。
+7. 完成恢复后，程序会回到 `POSE/TRANSPORT`。
 
 ### Step 5：运输与放置
 
@@ -165,6 +167,15 @@ entry:
   hold_before_squat_sec: 0.30
   squat_enter_speed_mps: 0.08
   print_vr_target_debug: false
+
+recovery:
+  kneel_hold_sec: 0.30
+  one_kneel_height: 0.50
+  one_kneel_hold_sec: 0.60
+  squat_recovery_height: 0.58
+  squat_hold_sec: 0.50
+  squat_to_stand_speed_mps: 0.06
+  allow_recovery_motion: false
 ```
 
 调整建议：
@@ -179,6 +190,8 @@ entry:
 | 按抓取模式无反应 | 检查终端是否提示缺少 robot feedback |
 | 站起太快 | 降低 `stand_recovery_speed_mps` |
 | 站起太慢 | 提高 `stand_recovery_speed_mps` |
+| 跪姿恢复前冲 | 保持 `allow_recovery_motion: false`，降低 `squat_to_stand_speed_mps` |
+| 单膝跪阶段不稳 | 提高 `one_kneel_height`，或缩短 `one_kneel_hold_sec` |
 | 站姿抓取移动太快 | 降低 `stand_manip_max_vx` |
 | 恢复时后退太快 | 降低 `stand_recovery_max_vx` |
 

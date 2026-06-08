@@ -44,6 +44,19 @@ entry:
   # Print per-frame VR target positions for debugging only.
   print_vr_target_debug: false
 
+recovery:
+  # KNEEL_MANIP recovery sequence while holding left_menu+B:
+  # two-knee kneel -> one-knee kneel -> squat -> slow stand.
+  kneel_hold_sec: 0.30
+  one_kneel_height: 0.50
+  one_kneel_hold_sec: 0.60
+  squat_recovery_height: 0.58
+  squat_hold_sec: 0.50
+  squat_to_stand_speed_mps: 0.06
+
+  # Keep false for first real-robot tests to avoid forward motion near shelves.
+  allow_recovery_motion: false
+
 movement:
   # Joystick dead zone used only in WBCD manipulation/recovery modes.
   joystick_dead_zone: 0.10
