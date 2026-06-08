@@ -33,6 +33,7 @@ import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
+import yaml
 import zmq
 
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
@@ -129,6 +130,153 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+
+
+class WBCDCompetitionMode(Enum):
+    TRANSPORT = 0
+    STAND_MANIP = 1
+    HALF_SQUAT_MANIP = 2
+    STAND_RECOVERY = 3
+
+
+class WBCDCompetitionConfig:
+    """Small hot-reloadable YAML config for competition-only Pico controls."""
+
+    DEFAULTS = {
+        "enabled": False,
+        "reload_interval_sec": 1.0,
+        "height": {
+            "stand_manip": -1.0,
+            "half_squat_default": 0.55,
+            "half_squat_min": 0.45,
+            "half_squat_max": 0.62,
+            "adjust_speed_mps": 0.06,
+            "stand_recovery_target": 0.74,
+            "stand_recovery_speed_mps": 0.10,
+        },
+        "movement": {
+            "joystick_dead_zone": 0.10,
+            "stand_manip_max_vx": 0.10,
+            "stand_manip_max_wz": 0.25,
+            "stand_recovery_max_vx": 0.08,
+            "stand_recovery_max_wz": 0.25,
+            "half_squat_allow_motion": False,
+        },
+        "buttons": {
+            "modifier": "left_menu_button",
+            "stand_manip": "A",
+            "half_squat_manip": "X",
+            "hold_stand_recovery": "B",
+            "height_up": "Y",
+            "height_down": "X",
+        },
+        "logging": {
+            "print_mode_changes": True,
+            "print_config_reload": True,
+        },
+    }
+
+    def __init__(self, path: str | None = None):
+        self.path = path or default_wbcd_config_path()
+        self.data = self._deepcopy_defaults()
+        self._mtime = None
+        self._last_check = 0.0
+        self.load(force=True)
+
+    @staticmethod
+    def _deepcopy_defaults():
+        import copy
+
+        return copy.deepcopy(WBCDCompetitionConfig.DEFAULTS)
+
+    @staticmethod
+    def _merge(base: dict, override: dict) -> dict:
+        merged = dict(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = WBCDCompetitionConfig._merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def load(self, force: bool = False) -> bool:
+        try:
+            if not os.path.exists(self.path):
+                if force:
+                    print(f"[WBCD] Config not found, using defaults: {self.path}")
+                return False
+            mtime = os.path.getmtime(self.path)
+            if not force and self._mtime == mtime:
+                return False
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError("top-level YAML value must be a mapping")
+            self.data = self._merge(self._deepcopy_defaults(), loaded)
+            self._mtime = mtime
+            if self.get_bool("logging", "print_config_reload", default=True):
+                print(f"[WBCD] Config loaded: {self.path}")
+            return True
+        except Exception as e:
+            print(f"[WBCD] Config reload failed, keeping previous config: {e}")
+            return False
+
+    def reload_if_needed(self):
+        now = time.time()
+        interval = self.get_float("reload_interval_sec", default=1.0)
+        if now - self._last_check >= interval:
+            self._last_check = now
+            self.load(force=False)
+
+    def get(self, *keys, default=None):
+        value = self.data
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return default
+            value = value[key]
+        return value
+
+    def get_float(self, *keys, default: float = 0.0) -> float:
+        try:
+            return float(self.get(*keys, default=default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def get_bool(self, *keys, default: bool = False) -> bool:
+        value = self.get(*keys, default=default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def get_str(self, *keys, default: str = "") -> str:
+        value = self.get(*keys, default=default)
+        return str(value)
+
+    @property
+    def enabled(self) -> bool:
+        return self.get_bool("enabled", default=False)
+
+
+def default_wbcd_config_path() -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(script_dir, "..", "config", "wbcd_pico_competition.yaml"))
+
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def _face_button_pressed(name: str, a_pressed: bool, b_pressed: bool, x_pressed: bool, y_pressed: bool) -> bool:
+    name = name.upper()
+    if name == "A":
+        return bool(a_pressed)
+    if name == "B":
+        return bool(b_pressed)
+    if name == "X":
+        return bool(x_pressed)
+    if name == "Y":
+        return bool(y_pressed)
+    return False
 
 
 ### Parse 3 point pose from SMPL
@@ -1625,6 +1773,7 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        wbcd_config: WBCDCompetitionConfig | None = None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1642,9 +1791,64 @@ class PlannerStreamer:
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
         self.last_xrt_timestamp = None
+        self.wbcd_config = wbcd_config
+        self.wbcd_mode = WBCDCompetitionMode.TRANSPORT
+        self.wbcd_height = self._cfg_float("height", "half_squat_default", default=0.55)
+        self.wbcd_recovery_hold = False
+        self._wbcd_return_to_pose = False
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+
+    def _cfg_float(self, *keys, default: float = 0.0) -> float:
+        if self.wbcd_config is None:
+            return float(default)
+        return self.wbcd_config.get_float(*keys, default=default)
+
+    def _cfg_bool(self, *keys, default: bool = False) -> bool:
+        if self.wbcd_config is None:
+            return bool(default)
+        return self.wbcd_config.get_bool(*keys, default=default)
+
+    def wbcd_enabled(self) -> bool:
+        return self.wbcd_config is not None and self.wbcd_config.enabled
+
+    def is_wbcd_active(self) -> bool:
+        return self.wbcd_mode != WBCDCompetitionMode.TRANSPORT
+
+    def enter_wbcd_mode(self, mode: WBCDCompetitionMode):
+        if mode == WBCDCompetitionMode.HALF_SQUAT_MANIP:
+            default_height = self._cfg_float("height", "half_squat_default", default=0.55)
+            min_height = self._cfg_float("height", "half_squat_min", default=0.45)
+            max_height = self._cfg_float("height", "half_squat_max", default=0.62)
+            self.wbcd_height = clamp(default_height, min_height, max_height)
+        elif mode == WBCDCompetitionMode.STAND_MANIP:
+            self.wbcd_height = self._cfg_float("height", "stand_manip", default=-1.0)
+        elif mode == WBCDCompetitionMode.STAND_RECOVERY:
+            if self.wbcd_mode == WBCDCompetitionMode.STAND_MANIP:
+                self.wbcd_height = self._cfg_float("height", "stand_recovery_target", default=0.74)
+            elif self.wbcd_height < 0.0:
+                self.wbcd_height = self._cfg_float("height", "half_squat_default", default=0.55)
+        self.wbcd_mode = mode
+        self._wbcd_return_to_pose = False
+        if self._cfg_bool("logging", "print_mode_changes", default=True):
+            print(f"[WBCD] Mode -> {self.wbcd_mode.name}, height={self.wbcd_height:.3f}")
+
+    def clear_wbcd_mode(self):
+        if self.wbcd_mode != WBCDCompetitionMode.TRANSPORT:
+            self.wbcd_mode = WBCDCompetitionMode.TRANSPORT
+            self.wbcd_recovery_hold = False
+            self._wbcd_return_to_pose = False
+            if self._cfg_bool("logging", "print_mode_changes", default=True):
+                print("[WBCD] Mode -> TRANSPORT")
+
+    def set_wbcd_recovery_hold(self, held: bool):
+        self.wbcd_recovery_hold = bool(held)
+
+    def consume_wbcd_return_to_pose(self) -> bool:
+        value = self._wbcd_return_to_pose
+        self._wbcd_return_to_pose = False
+        return value
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1674,6 +1878,144 @@ class PlannerStreamer:
             )
             self.three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
 
+    def _compute_wbcd_movement(self, max_vx: float, max_wz: float) -> tuple[list[float], list[float], float, LocomotionMode]:
+        lx, ly, rx, _ = get_controller_axes()
+        dead_zone = self._cfg_float("movement", "joystick_dead_zone", default=0.10)
+        self.yaw_accumulator.dyaw = max_wz * (-rx) * self.dt
+        if abs(rx) >= dead_zone:
+            self.yaw_accumulator.yaw_angle_rad += self.yaw_accumulator.dyaw
+            self.yaw_accumulator.heading = [
+                np.cos(self.yaw_accumulator.yaw_angle_rad),
+                np.sin(self.yaw_accumulator.yaw_angle_rad),
+                0.0,
+            ]
+        facing = self.yaw_accumulator.heading
+
+        raw = abs(ly)
+        if raw < dead_zone:
+            return [0.0, 0.0, 0.0], facing, -1.0, LocomotionMode.IDLE
+
+        mag = (raw - dead_zone) / max(1e-6, 1.0 - dead_zone)
+        mag = clamp(mag, 0.0, 1.0)
+        direction_sign = 1.0 if ly >= 0.0 else -1.0
+        movement_local = np.array([0.0, direction_sign * mag])
+        perp_x, perp_y = -facing[1], facing[0]
+        rotation_facing = np.array([[perp_x, perp_y], [facing[0], facing[1]]])
+        movement_global = rotation_facing @ movement_local
+        speed = max_vx * mag
+        return [movement_global[0], movement_global[1], 0.0], facing, speed, LocomotionMode.SLOW_WALK
+
+    def _collect_vr3pt_targets(self):
+        vr_3pt_position = None
+        vr_3pt_orientation = None
+        sample = self.reader.get_latest()
+        if sample is not None:
+            print("[PlannerLoop] Sending VR 3-point pose as target")
+            vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+            vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
+            vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+
+        (
+            _left_menu_button,
+            left_trigger,
+            right_trigger,
+            left_grip,
+            right_grip,
+        ) = get_controller_inputs()
+        lh_joints, rh_joints = compute_hand_joints_from_inputs(
+            self.left_hand_ik_solver,
+            self.right_hand_ik_solver,
+            left_trigger,
+            left_grip,
+            right_trigger,
+            right_grip,
+        )
+        left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
+        right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+        return vr_3pt_position, vr_3pt_orientation, left_hand_position, right_hand_position
+
+    def _run_wbcd_once(self, a_pressed: bool, b_pressed: bool, x_pressed: bool, y_pressed: bool):
+        self.wbcd_config.reload_if_needed()
+        left_menu_button, _, _, _, _ = get_controller_inputs()
+
+        mode_to_send = LocomotionMode.IDLE
+        height = -1.0
+        movement = [0.0, 0.0, 0.0]
+        facing = self.yaw_accumulator.update(0.0, self.dt)
+        speed = -1.0
+
+        if self.wbcd_mode == WBCDCompetitionMode.STAND_MANIP:
+            height = self._cfg_float("height", "stand_manip", default=-1.0)
+            max_vx = self._cfg_float("movement", "stand_manip_max_vx", default=0.10)
+            max_wz = self._cfg_float("movement", "stand_manip_max_wz", default=0.25)
+            movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
+
+        elif self.wbcd_mode == WBCDCompetitionMode.HALF_SQUAT_MANIP:
+            if not left_menu_button:
+                adjust_speed = self._cfg_float("height", "adjust_speed_mps", default=0.06)
+                if _face_button_pressed(
+                    self.wbcd_config.get_str("buttons", "height_up", default="Y"),
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                ):
+                    self.wbcd_height += adjust_speed * self.dt
+                if _face_button_pressed(
+                    self.wbcd_config.get_str("buttons", "height_down", default="X"),
+                    a_pressed,
+                    b_pressed,
+                    x_pressed,
+                    y_pressed,
+                ):
+                    self.wbcd_height -= adjust_speed * self.dt
+            min_height = self._cfg_float("height", "half_squat_min", default=0.45)
+            max_height = self._cfg_float("height", "half_squat_max", default=0.62)
+            self.wbcd_height = clamp(self.wbcd_height, min_height, max_height)
+            height = self.wbcd_height
+            mode_to_send = LocomotionMode.IDLE_SQUAT
+
+        elif self.wbcd_mode == WBCDCompetitionMode.STAND_RECOVERY:
+            target = self._cfg_float("height", "stand_recovery_target", default=0.74)
+            if self.wbcd_recovery_hold:
+                rise_speed = self._cfg_float("height", "stand_recovery_speed_mps", default=0.10)
+                self.wbcd_height = min(target, self.wbcd_height + rise_speed * self.dt)
+                if self.wbcd_height >= target - 1e-4:
+                    self._wbcd_return_to_pose = True
+            height = self.wbcd_height
+            max_vx = self._cfg_float("movement", "stand_recovery_max_vx", default=0.08)
+            max_wz = self._cfg_float("movement", "stand_recovery_max_wz", default=0.25)
+            movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
+
+        (
+            vr_3pt_position,
+            vr_3pt_orientation,
+            left_hand_position,
+            right_hand_position,
+        ) = self._collect_vr3pt_targets()
+
+        msg = build_planner_message(
+            mode_to_send.value,
+            movement,
+            facing,
+            speed=speed,
+            height=height,
+            upper_body_position=None,
+            left_hand_position=left_hand_position,
+            right_hand_position=right_hand_position,
+            vr_3pt_position=vr_3pt_position,
+            vr_3pt_orientation=vr_3pt_orientation,
+            vr_3pt_compliance=None,
+        )
+        self.socket.send(msg)
+
+    def _pace_loop(self):
+        now = time.time()
+        sleep_t = self.dt - (now - self.last_send)
+        if sleep_t > 0:
+            time.sleep(sleep_t)
+        self.last_send = time.time()
+
     def run_once(self, stream_mode: StreamMode):
         """Execute one iteration of the planner control loop."""
         try:
@@ -1685,6 +2027,11 @@ class PlannerStreamer:
 
             # A+B => next mode; X+Y => previous mode (rising edges)
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            if self.wbcd_enabled() and self.is_wbcd_active():
+                self._run_wbcd_once(a_pressed, b_pressed, x_pressed, y_pressed)
+                self._pace_loop()
+                return
+
             ab_now = bool(a_pressed) and bool(b_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed)
             if ab_now and not self.prev_ab:
@@ -1793,11 +2140,7 @@ class PlannerStreamer:
             raise
 
         # pacing
-        now = time.time()
-        sleep_t = self.dt - (now - self.last_send)
-        if sleep_t > 0:
-            time.sleep(sleep_t)
-        self.last_send = time.time()
+        self._pace_loop()
 
 
 def run_pico_manager(
@@ -1814,6 +2157,7 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    wbcd_competition_config: str | None = None,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1876,6 +2220,11 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        wbcd_config=WBCDCompetitionConfig(
+            wbcd_competition_config
+            or os.environ.get("WBCD_PICO_COMPETITION_CONFIG")
+            or default_wbcd_config_path()
+        ),
     )
 
     # State machine diagram:
@@ -1905,22 +2254,129 @@ def run_pico_manager(
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
+        prev_wbcd_stand = False
+        prev_wbcd_half_squat = False
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
             left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            if planner_streamer.wbcd_config is not None:
+                planner_streamer.wbcd_config.reload_if_needed()
 
             left_axis_click, _ = get_axis_clicks()
 
-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
-            ax_pressed = (a_pressed) and (x_pressed)
+            wbcd_enabled = planner_streamer.wbcd_enabled()
+            if not wbcd_enabled and planner_streamer.is_wbcd_active():
+                planner_streamer.clear_wbcd_mode()
 
-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
-            by_pressed = (b_pressed) and (y_pressed)
+            wbcd_stand_pressed = wbcd_enabled and left_menu_button and _face_button_pressed(
+                planner_streamer.wbcd_config.get_str("buttons", "stand_manip", default="A"),
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+            )
+            wbcd_half_squat_pressed = wbcd_enabled and left_menu_button and _face_button_pressed(
+                planner_streamer.wbcd_config.get_str("buttons", "half_squat_manip", default="X"),
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+            )
+            wbcd_recovery_pressed = wbcd_enabled and left_menu_button and _face_button_pressed(
+                planner_streamer.wbcd_config.get_str("buttons", "hold_stand_recovery", default="B"),
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+            )
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
+            # Existing Sonic combos are suppressed while left_menu is held for WBCD chords.
+            ax_pressed = (a_pressed) and (x_pressed) and not left_menu_button
+            by_pressed = (b_pressed) and (y_pressed) and not left_menu_button
+
+            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop.
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+
+            if wbcd_enabled and planner_streamer.is_wbcd_active():
+                current_wbcd_mode = planner_streamer.wbcd_mode
+                if wbcd_stand_pressed and not prev_wbcd_stand:
+                    planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_MANIP)
+                    planner_streamer.recalibrate_for_vr3pt()
+                elif wbcd_half_squat_pressed and not prev_wbcd_half_squat:
+                    planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
+                    planner_streamer.recalibrate_for_vr3pt()
+                elif current_wbcd_mode != WBCDCompetitionMode.STAND_RECOVERY:
+                    if wbcd_recovery_pressed:
+                        planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_RECOVERY)
+                        planner_streamer.set_wbcd_recovery_hold(True)
+                else:
+                    planner_streamer.set_wbcd_recovery_hold(wbcd_recovery_pressed)
+
+                if start_combo and not prev_start_combo:
+                    planner_streamer.clear_wbcd_mode()
+                    socket.send(build_command_message(start=False, stop=True, planner=True))
+                    exit()
+                if ax_pressed and not prev_ax_pressed:
+                    planner_streamer.clear_wbcd_mode()
+                    pose_streamer.reset_yaw()
+                    socket.send(build_command_message(start=True, stop=False, planner=False))
+                    print("[Manager] StreamMode switch: PLANNER_VR_3PT -> POSE")
+                    current_mode = StreamMode.POSE
+                    prev_ax_pressed = ax_pressed
+                    prev_by_pressed = by_pressed
+                    prev_start_combo = start_combo
+                    prev_left_axis_click = left_axis_click
+                    prev_wbcd_stand = wbcd_stand_pressed
+                    prev_wbcd_half_squat = wbcd_half_squat_pressed
+                    continue
+                if by_pressed and not prev_by_pressed:
+                    planner_streamer.clear_wbcd_mode()
+                    pose_streamer.reset_yaw()
+                    socket.send(build_command_message(start=True, stop=False, planner=False))
+                    print("[Manager] StreamMode switch: PLANNER_VR_3PT -> POSE")
+                    current_mode = StreamMode.POSE
+                    prev_ax_pressed = ax_pressed
+                    prev_by_pressed = by_pressed
+                    prev_start_combo = start_combo
+                    prev_left_axis_click = left_axis_click
+                    prev_wbcd_stand = wbcd_stand_pressed
+                    prev_wbcd_half_squat = wbcd_half_squat_pressed
+                    continue
+                else:
+                    new_mode = StreamMode.PLANNER_VR_3PT
+                    planner_streamer.run_once(new_mode)
+                    if planner_streamer.consume_wbcd_return_to_pose():
+                        planner_streamer.clear_wbcd_mode()
+                        socket.send(build_command_message(start=True, stop=False, planner=False))
+                        print("[Manager] StreamMode switch: PLANNER_VR_3PT -> POSE")
+                        current_mode = StreamMode.POSE
+                        prev_ax_pressed = ax_pressed
+                        prev_by_pressed = by_pressed
+                        prev_start_combo = start_combo
+                        prev_left_axis_click = left_axis_click
+                        prev_wbcd_stand = wbcd_stand_pressed
+                        prev_wbcd_half_squat = wbcd_half_squat_pressed
+                        continue
+
+                    socket.send(
+                        pack_pose_message(
+                            {
+                                "stream_mode": np.array([new_mode.value], dtype=np.int32),
+                                "toggle_data_collection": np.array([False], dtype=bool),
+                                "toggle_data_abort": np.array([False], dtype=bool),
+                            },
+                            topic="manager_state",
+                        )
+                    )
+                    prev_ax_pressed = ax_pressed
+                    prev_by_pressed = by_pressed
+                    prev_start_combo = start_combo
+                    prev_left_axis_click = left_axis_click
+                    prev_wbcd_stand = wbcd_stand_pressed
+                    prev_wbcd_half_squat = wbcd_half_squat_pressed
+                    continue
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -1946,6 +2402,12 @@ def run_pico_manager(
             elif current_mode == StreamMode.POSE:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
+                elif wbcd_stand_pressed and not prev_wbcd_stand:
+                    new_mode = StreamMode.PLANNER_VR_3PT
+                    planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_MANIP)
+                elif wbcd_half_squat_pressed and not prev_wbcd_half_squat:
+                    new_mode = StreamMode.PLANNER_VR_3PT
+                    planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
@@ -1986,6 +2448,8 @@ def run_pico_manager(
             if new_mode != current_mode:
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
+                if new_mode != StreamMode.PLANNER_VR_3PT:
+                    planner_streamer.clear_wbcd_mode()
 
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
@@ -2060,6 +2524,8 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+            prev_wbcd_stand = wbcd_stand_pressed
+            prev_wbcd_half_squat = wbcd_half_squat_pressed
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2156,6 +2622,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--wbcd_competition_config",
+        type=str,
+        default=None,
+        help="Path to WBCD competition teleop YAML config",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2196,6 +2668,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            wbcd_competition_config=args.wbcd_competition_config,
         )
     else:
         # Run legacy single-thread pose streaming
