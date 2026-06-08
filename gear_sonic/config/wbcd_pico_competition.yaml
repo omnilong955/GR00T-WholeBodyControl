@@ -42,7 +42,7 @@ entry:
   squat_enter_speed_mps: 0.08
 
   # Print per-frame VR target positions for debugging only.
-  print_vr_target_debug: false
+  print_vr_target_debug: true
 
 recovery:
   # KNEEL_MANIP recovery sequence while holding left_menu+B:
@@ -57,15 +57,17 @@ recovery:
   # Keep false for first real-robot tests to avoid forward motion near shelves.
   allow_recovery_motion: false
 
-lean:
-  # Virtual lean changes the VR_3PT torso/neck target, not the waist joints directly.
+torso:
+  # Direct waist pitch offset for WBCD testing only.
+  # Applies in HALF_SQUAT_MANIP and KNEEL_MANIP; resets when recovering/exiting.
   enabled: true
   default_pitch_deg: 0.0
   min_pitch_deg: 0.0
-  max_pitch_deg: 18.0
-  pitch_step_deg: 3.0
-  torso_forward_offset_per_deg: 0.008
-  torso_down_offset_per_deg: 0.003
+  max_pitch_deg: 12.0
+  pitch_step_deg: 0.5
+
+  # Keep true for safe tests. If feedback is missing, no waist target is sent.
+  require_robot_feedback: true
 
 movement:
   # Joystick dead zone used only in WBCD manipulation/recovery modes.
@@ -95,8 +97,11 @@ buttons:
   # KNEEL_MANIP: press once to adjust one step.
   height_up: Y
   height_down: X
-  lean_forward: B
-  lean_back: A
+
+  # Torso pitch step adjustment only applies in HALF_SQUAT_MANIP/KNEEL_MANIP
+  # when left_menu is not held.
+  torso_pitch_forward: B
+  torso_pitch_back: A
 
 logging:
   print_mode_changes: true

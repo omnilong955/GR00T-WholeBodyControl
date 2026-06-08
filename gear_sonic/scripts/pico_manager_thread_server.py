@@ -98,6 +98,9 @@ except ImportError:
     get_g1_key_frame_poses = None
 
 
+WBCD_TORSO_DEBUG_BUILD = "2026-06-09-torso-pitch-upper-body-v1"
+
+
 class LocomotionMode(IntEnum):
     """Locomotion mode enum for robot movement."""
 
@@ -182,14 +185,13 @@ class WBCDCompetitionConfig:
             "squat_to_stand_speed_mps": 0.06,
             "allow_recovery_motion": False,
         },
-        "lean": {
+        "torso": {
             "enabled": True,
             "default_pitch_deg": 0.0,
             "min_pitch_deg": 0.0,
-            "max_pitch_deg": 18.0,
-            "pitch_step_deg": 3.0,
-            "torso_forward_offset_per_deg": 0.003,
-            "torso_down_offset_per_deg": 0.0015,
+            "max_pitch_deg": 12.0,
+            "pitch_step_deg": 0.5,
+            "require_robot_feedback": True,
         },
         "movement": {
             "joystick_dead_zone": 0.10,
@@ -207,8 +209,8 @@ class WBCDCompetitionConfig:
             "hold_stand_recovery": "B",
             "height_up": "Y",
             "height_down": "X",
-            "lean_forward": "B",
-            "lean_back": "A",
+            "torso_pitch_forward": "B",
+            "torso_pitch_back": "A",
         },
         "logging": {
             "print_mode_changes": True,
@@ -552,6 +554,8 @@ def run_vr3pt_live_visualizer():
     # Initialize XRT
     subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
+    print(f"[WBCD] Torso debug build: {WBCD_TORSO_DEBUG_BUILD}")
+    print(f"[WBCD] Running script: {os.path.abspath(__file__)}")
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
         print("waiting for body data...")
@@ -1786,23 +1790,39 @@ class FeedbackReader:
         # return robot_model.get_joint_group_indices("upper_body")
         return [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28]
 
-    def poll_feedback(self):
+    def poll_feedback(self, verbose: bool = True, keep_previous_on_empty: bool = False) -> bool:
         """Poll for feedback once, and update internal state."""
         (
-            self.upper_body_position_target,
-            self.left_hand_position_target,
-            self.right_hand_position_target,
-            self.full_body_q_measured,
-        ) = self._process_upper_body_position_targets()
-        print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
+            upper_body_position_target,
+            left_hand_position_target,
+            right_hand_position_target,
+            full_body_q_measured,
+        ) = self._process_upper_body_position_targets(verbose=verbose)
+        if (
+            keep_previous_on_empty
+            and upper_body_position_target is None
+            and left_hand_position_target is None
+            and right_hand_position_target is None
+            and full_body_q_measured is None
+        ):
+            return False
+        self.upper_body_position_target = upper_body_position_target
+        self.left_hand_position_target = left_hand_position_target
+        self.right_hand_position_target = right_hand_position_target
+        self.full_body_q_measured = full_body_q_measured
+        if verbose:
+            print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
+        return upper_body_position_target is not None
 
     def _process_upper_body_position_targets(
         self,
+        verbose: bool = True,
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         data = self.poller.get_data()
 
         if data is None:
-            print("[PlannerLoop] No feedback data received")
+            if verbose:
+                print("[PlannerLoop] No feedback data received")
             return None, None, None, None
 
         unpacked = msgpack.unpackb(data, raw=False)
@@ -1812,19 +1832,22 @@ class FeedbackReader:
             full_body_q = np.array(body_q_swizzled, dtype=np.float64)
             body_q = [body_q_swizzled[i] for i in self.upper_body_joint_indices]
         else:
-            print("[PlannerLoop] body_q_measured not in feedback data")
+            if verbose:
+                print("[PlannerLoop] body_q_measured not in feedback data")
             body_q = None
 
         if "left_hand_q_measured" in unpacked:
             left_hand_q = unpacked["left_hand_q_measured"]
         else:
-            print("[PlannerLoop] left_hand_q_measured not in feedback data")
+            if verbose:
+                print("[PlannerLoop] left_hand_q_measured not in feedback data")
             left_hand_q = None
 
         if "right_hand_q_measured" in unpacked:
             right_hand_q = unpacked["right_hand_q_measured"]
         else:
-            print("[PlannerLoop] right_hand_q_measured not in feedback data")
+            if verbose:
+                print("[PlannerLoop] right_hand_q_measured not in feedback data")
             right_hand_q = None
 
         return body_q, left_hand_q, right_hand_q, full_body_q
@@ -1870,9 +1893,15 @@ class PlannerStreamer:
         self._prev_wbcd_height_down = False
         self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
         self._kneel_recovery_stage_elapsed = 0.0
-        self.wbcd_lean_pitch_deg = self._cfg_float("lean", "default_pitch_deg", default=0.0)
-        self._prev_wbcd_lean_forward = False
-        self._prev_wbcd_lean_back = False
+        self.wbcd_torso_pitch_deg = self._cfg_float(
+            "torso", "default_pitch_deg", default=0.0
+        )
+        self._prev_wbcd_torso_pitch_forward = False
+        self._prev_wbcd_torso_pitch_back = False
+        self._last_wbcd_upper_body_baseline = None
+        self._last_wbcd_upper_body_position = None
+        self._wbcd_torso_pitch_print_pending = False
+        self._prev_wbcd_debug_buttons = (False, False, False, False, False)
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -1893,28 +1922,136 @@ class PlannerStreamer:
     def is_wbcd_active(self) -> bool:
         return self.wbcd_mode != WBCDCompetitionMode.TRANSPORT
 
-    def _clamp_wbcd_lean(self):
-        min_pitch = self._cfg_float("lean", "min_pitch_deg", default=0.0)
-        max_pitch = self._cfg_float("lean", "max_pitch_deg", default=18.0)
-        self.wbcd_lean_pitch_deg = clamp(self.wbcd_lean_pitch_deg, min_pitch, max_pitch)
-
-    def _reset_wbcd_lean(self):
-        self.wbcd_lean_pitch_deg = self._cfg_float("lean", "default_pitch_deg", default=0.0)
-        self._clamp_wbcd_lean()
-
-    def _wbcd_lean_offsets(self) -> tuple[float, float]:
-        forward_per_deg = self._cfg_float("lean", "torso_forward_offset_per_deg", default=0.003)
-        down_per_deg = self._cfg_float("lean", "torso_down_offset_per_deg", default=0.0015)
-        return forward_per_deg * self.wbcd_lean_pitch_deg, down_per_deg * self.wbcd_lean_pitch_deg
-
-    def _print_wbcd_lean_state(self):
-        forward_offset, down_offset = self._wbcd_lean_offsets()
-        print(
-            "[WBCD] Lean pitch -> "
-            f"{self.wbcd_lean_pitch_deg:.1f} deg, "
-            f"torso_forward=+{forward_offset:.3f} m, "
-            f"torso_down=-{down_offset:.3f} m"
+    def _reset_wbcd_torso_pitch(self):
+        self.wbcd_torso_pitch_deg = self._clamp_wbcd_torso_pitch(
+            self._cfg_float("torso", "default_pitch_deg", default=0.0)
         )
+        self._prev_wbcd_torso_pitch_forward = False
+        self._prev_wbcd_torso_pitch_back = False
+        self._last_wbcd_upper_body_baseline = None
+        self._last_wbcd_upper_body_position = None
+        self._wbcd_torso_pitch_print_pending = False
+        self._prev_wbcd_debug_buttons = (False, False, False, False, False)
+
+    def _clamp_wbcd_torso_pitch(self, pitch_deg: float) -> float:
+        min_deg = self._cfg_float("torso", "min_pitch_deg", default=0.0)
+        max_deg = self._cfg_float("torso", "max_pitch_deg", default=12.0)
+        return clamp(pitch_deg, min_deg, max_deg)
+
+    def _poll_wbcd_upper_body_baseline(self):
+        self.feedback_reader.poll_feedback(verbose=False, keep_previous_on_empty=True)
+        baseline = self.feedback_reader.upper_body_position_target
+        if baseline is None:
+            baseline = self._last_wbcd_upper_body_baseline
+        if baseline is None:
+            return None
+        baseline = np.asarray(baseline, dtype=np.float64).reshape(-1)
+        if baseline.shape[0] != 17:
+            print(f"[WBCD] Invalid upper_body_position feedback length: {baseline.shape[0]}")
+            return None
+        self._last_wbcd_upper_body_baseline = baseline.copy()
+        return baseline
+
+    def _handle_wbcd_torso_pitch_buttons(
+        self,
+        a_pressed: bool,
+        b_pressed: bool,
+        x_pressed: bool,
+        y_pressed: bool,
+        left_menu_button: bool,
+    ):
+        active_modes = (
+            WBCDCompetitionMode.HALF_SQUAT_MANIP,
+            WBCDCompetitionMode.KNEEL_MANIP,
+        )
+        if self.wbcd_mode not in active_modes:
+            self._prev_wbcd_torso_pitch_forward = False
+            self._prev_wbcd_torso_pitch_back = False
+            return
+
+        current_debug_buttons = (
+            bool(left_menu_button),
+            bool(a_pressed),
+            bool(b_pressed),
+            bool(x_pressed),
+            bool(y_pressed),
+        )
+        if current_debug_buttons != self._prev_wbcd_debug_buttons:
+            print(
+                "[WBCD] buttons "
+                f"left_menu={int(left_menu_button)} A={int(a_pressed)} "
+                f"B={int(b_pressed)} X={int(x_pressed)} Y={int(y_pressed)}, "
+                f"mode={self.wbcd_mode.name}, torso_offset={self.wbcd_torso_pitch_deg:.1f}deg"
+            )
+            self._prev_wbcd_debug_buttons = current_debug_buttons
+
+        forward_now = (
+            not left_menu_button
+            and _face_button_pressed(
+                self.wbcd_config.get_str("buttons", "torso_pitch_forward", default="B"),
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+            )
+        )
+        back_now = (
+            not left_menu_button
+            and _face_button_pressed(
+                self.wbcd_config.get_str("buttons", "torso_pitch_back", default="A"),
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+            )
+        )
+
+        step = self._cfg_float("torso", "pitch_step_deg", default=0.5)
+        changed = False
+        if forward_now and not self._prev_wbcd_torso_pitch_forward:
+            self.wbcd_torso_pitch_deg = self._clamp_wbcd_torso_pitch(
+                self.wbcd_torso_pitch_deg + step
+            )
+            changed = True
+        if back_now and not self._prev_wbcd_torso_pitch_back:
+            self.wbcd_torso_pitch_deg = self._clamp_wbcd_torso_pitch(
+                self.wbcd_torso_pitch_deg - step
+            )
+            changed = True
+
+        self._prev_wbcd_torso_pitch_forward = forward_now
+        self._prev_wbcd_torso_pitch_back = back_now
+        if changed:
+            self._wbcd_torso_pitch_print_pending = True
+            print(f"[WBCD] torso pitch offset -> {self.wbcd_torso_pitch_deg:.1f} deg")
+
+    def _build_wbcd_upper_body_position(self):
+        if not self._cfg_bool("torso", "enabled", default=True):
+            return None
+        if self.wbcd_mode not in (
+            WBCDCompetitionMode.HALF_SQUAT_MANIP,
+            WBCDCompetitionMode.KNEEL_MANIP,
+        ):
+            return None
+
+        baseline = self._poll_wbcd_upper_body_baseline()
+        if baseline is None:
+            if self._cfg_bool("torso", "require_robot_feedback", default=True):
+                print("[WBCD] torso pitch disabled this frame: no upper_body_position feedback")
+            return None
+
+        upper_body_position = baseline.copy()
+        upper_body_position[2] += np.deg2rad(self.wbcd_torso_pitch_deg)
+        self._last_wbcd_upper_body_position = upper_body_position.copy()
+        if self._wbcd_torso_pitch_print_pending:
+            print(
+                "[WBCD] torso pitch send "
+                f"offset={self.wbcd_torso_pitch_deg:.1f}deg, "
+                f"waist_ypr(rad)=({upper_body_position[0]:.3f}, "
+                f"{upper_body_position[1]:.3f}, {upper_body_position[2]:.3f})"
+            )
+            self._wbcd_torso_pitch_print_pending = False
+        return upper_body_position.astype(np.float32).tolist()
 
     def prepare_wbcd_vr3pt_entry(self, mode: WBCDCompetitionMode) -> bool:
         sample = self.reader.get_latest()
@@ -1942,8 +2079,6 @@ class PlannerStreamer:
     def enter_wbcd_mode(self, mode: WBCDCompetitionMode):
         self._prev_wbcd_height_up = False
         self._prev_wbcd_height_down = False
-        self._prev_wbcd_lean_forward = False
-        self._prev_wbcd_lean_back = False
         if mode != WBCDCompetitionMode.STAND_RECOVERY:
             self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
             self._kneel_recovery_stage_elapsed = 0.0
@@ -1974,6 +2109,7 @@ class PlannerStreamer:
             elif self.wbcd_height < 0.0:
                 self.wbcd_height = self._cfg_float("height", "half_squat_default", default=0.55)
             self._wbcd_entry_hold_until = 0.0
+            self._reset_wbcd_torso_pitch()
         self.wbcd_mode = mode
         self._wbcd_return_to_pose = False
         if self._cfg_bool("logging", "print_mode_changes", default=True):
@@ -1987,11 +2123,9 @@ class PlannerStreamer:
             self._wbcd_entry_hold_until = 0.0
             self._prev_wbcd_height_up = False
             self._prev_wbcd_height_down = False
-            self._prev_wbcd_lean_forward = False
-            self._prev_wbcd_lean_back = False
             self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
             self._kneel_recovery_stage_elapsed = 0.0
-            self._reset_wbcd_lean()
+            self._reset_wbcd_torso_pitch()
             if self._cfg_bool("logging", "print_mode_changes", default=True):
                 print("[WBCD] Mode -> TRANSPORT")
 
@@ -2005,6 +2139,7 @@ class PlannerStreamer:
         self._wbcd_entry_hold_until = 0.0
         self._kneel_recovery_stage = WBCDKneelRecoveryStage.KNEEL_HOLD
         self._kneel_recovery_stage_elapsed = 0.0
+        self._reset_wbcd_torso_pitch()
         if self._cfg_bool("logging", "print_mode_changes", default=True):
             print(
                 "[WBCD] Mode -> STAND_RECOVERY, "
@@ -2078,17 +2213,6 @@ class PlannerStreamer:
 
         print("[PlannerLoop] Sending VR 3-point pose as target")
         vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-        if self._cfg_bool("lean", "enabled", default=True):
-            self._clamp_wbcd_lean()
-            pitch_deg = self.wbcd_lean_pitch_deg
-            if abs(pitch_deg) > 1e-6:
-                torso_idx = 2
-                forward_offset, down_offset = self._wbcd_lean_offsets()
-                vr_3pt_pose[torso_idx, 0] += forward_offset
-                vr_3pt_pose[torso_idx, 2] -= down_offset
-                torso_rot = sRot.from_quat(vr_3pt_pose[torso_idx, 3:], scalar_first=True)
-                lean_rot = sRot.from_euler("y", -pitch_deg, degrees=True)
-                vr_3pt_pose[torso_idx, 3:] = (lean_rot * torso_rot).as_quat(scalar_first=True)
         vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
         vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
@@ -2114,38 +2238,9 @@ class PlannerStreamer:
     def _run_wbcd_once(self, a_pressed: bool, b_pressed: bool, x_pressed: bool, y_pressed: bool):
         self.wbcd_config.reload_if_needed()
         left_menu_button, _, _, _, _ = get_controller_inputs()
-        if self._cfg_bool("lean", "enabled", default=True):
-            lean_forward_now = (
-                not left_menu_button
-                and _face_button_pressed(
-                    self.wbcd_config.get_str("buttons", "lean_forward", default="B"),
-                    a_pressed,
-                    b_pressed,
-                    x_pressed,
-                    y_pressed,
-                )
-            )
-            lean_back_now = (
-                not left_menu_button
-                and _face_button_pressed(
-                    self.wbcd_config.get_str("buttons", "lean_back", default="A"),
-                    a_pressed,
-                    b_pressed,
-                    x_pressed,
-                    y_pressed,
-                )
-            )
-            step = self._cfg_float("lean", "pitch_step_deg", default=3.0)
-            if lean_forward_now and not self._prev_wbcd_lean_forward:
-                self.wbcd_lean_pitch_deg += step
-                self._clamp_wbcd_lean()
-                self._print_wbcd_lean_state()
-            if lean_back_now and not self._prev_wbcd_lean_back:
-                self.wbcd_lean_pitch_deg -= step
-                self._clamp_wbcd_lean()
-                self._print_wbcd_lean_state()
-            self._prev_wbcd_lean_forward = lean_forward_now
-            self._prev_wbcd_lean_back = lean_back_now
+        self._handle_wbcd_torso_pitch_buttons(
+            a_pressed, b_pressed, x_pressed, y_pressed, left_menu_button
+        )
 
         mode_to_send = LocomotionMode.IDLE
         height = -1.0
@@ -2323,9 +2418,9 @@ class PlannerStreamer:
                 "[WBCD] VR targets "
                 f"L={vr_3pt_position[0:3]}, R={vr_3pt_position[3:6]}, "
                 f"T={vr_3pt_position[6:9]}, "
-                f"lean={self.wbcd_lean_pitch_deg:.1f} deg, "
                 f"height={height:.3f}, mode={mode_to_send.name}"
             )
+        upper_body_position = self._build_wbcd_upper_body_position()
 
         msg = build_planner_message(
             mode_to_send.value,
@@ -2333,7 +2428,7 @@ class PlannerStreamer:
             facing,
             speed=speed,
             height=height,
-            upper_body_position=None,
+            upper_body_position=upper_body_position,
             left_hand_position=left_hand_position,
             right_hand_position=right_hand_position,
             vr_3pt_position=vr_3pt_position,
