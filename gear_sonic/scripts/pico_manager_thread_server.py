@@ -2306,10 +2306,8 @@ def run_pico_manager(
                 current_wbcd_mode = planner_streamer.wbcd_mode
                 if wbcd_stand_pressed and not prev_wbcd_stand:
                     planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_MANIP)
-                    planner_streamer.recalibrate_for_vr3pt()
                 elif wbcd_half_squat_pressed and not prev_wbcd_half_squat:
                     planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
-                    planner_streamer.recalibrate_for_vr3pt()
                 elif current_wbcd_mode != WBCDCompetitionMode.STAND_RECOVERY:
                     if wbcd_recovery_pressed:
                         planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_RECOVERY)
@@ -2473,7 +2471,10 @@ def run_pico_manager(
                     # whether entering from POSE or returning from VR_3PT
                     # (the old targets are stale after VR_3PT moved the arms)
                     planner_streamer.save_upper_body_position_target()
-                elif new_mode == StreamMode.PLANNER_VR_3PT:
+                elif (
+                    new_mode == StreamMode.PLANNER_VR_3PT
+                    and not planner_streamer.is_wbcd_active()
+                ):
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
