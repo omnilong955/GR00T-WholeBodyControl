@@ -16,6 +16,11 @@ height:
   half_squat_min: 0.45
   half_squat_max: 0.62
 
+  # Low-shelf static kneel manipulation. Enter only after HALF_SQUAT_MANIP.
+  kneel_default: 0.50
+  kneel_min: 0.30
+  kneel_max: 0.70
+
   # Height changes while holding Y/X in HALF_SQUAT_MANIP.
   adjust_speed_mps: 0.06
 
@@ -43,6 +48,7 @@ buttons:
   modifier: left_menu_button
   stand_manip: A
   half_squat_manip: X
+  kneel_manip: Y
   hold_stand_recovery: B
 
   # Height adjustment only applies in HALF_SQUAT_MANIP when left_menu is not held.

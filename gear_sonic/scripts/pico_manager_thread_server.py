@@ -137,6 +137,7 @@ class WBCDCompetitionMode(Enum):
     STAND_MANIP = 1
     HALF_SQUAT_MANIP = 2
     STAND_RECOVERY = 3
+    KNEEL_MANIP = 4
 
 
 class WBCDCompetitionConfig:
@@ -150,6 +151,9 @@ class WBCDCompetitionConfig:
             "half_squat_default": 0.55,
             "half_squat_min": 0.45,
             "half_squat_max": 0.62,
+            "kneel_default": 0.50,
+            "kneel_min": 0.30,
+            "kneel_max": 0.70,
             "adjust_speed_mps": 0.06,
             "stand_recovery_target": 0.74,
             "stand_recovery_speed_mps": 0.10,
@@ -166,6 +170,7 @@ class WBCDCompetitionConfig:
             "modifier": "left_menu_button",
             "stand_manip": "A",
             "half_squat_manip": "X",
+            "kneel_manip": "Y",
             "hold_stand_recovery": "B",
             "height_up": "Y",
             "height_down": "X",
@@ -1822,6 +1827,11 @@ class PlannerStreamer:
             min_height = self._cfg_float("height", "half_squat_min", default=0.45)
             max_height = self._cfg_float("height", "half_squat_max", default=0.62)
             self.wbcd_height = clamp(default_height, min_height, max_height)
+        elif mode == WBCDCompetitionMode.KNEEL_MANIP:
+            default_height = self._cfg_float("height", "kneel_default", default=0.50)
+            min_height = self._cfg_float("height", "kneel_min", default=0.30)
+            max_height = self._cfg_float("height", "kneel_max", default=0.70)
+            self.wbcd_height = clamp(default_height, min_height, max_height)
         elif mode == WBCDCompetitionMode.STAND_MANIP:
             self.wbcd_height = self._cfg_float("height", "stand_manip", default=-1.0)
         elif mode == WBCDCompetitionMode.STAND_RECOVERY:
@@ -1974,6 +1984,15 @@ class PlannerStreamer:
             self.wbcd_height = clamp(self.wbcd_height, min_height, max_height)
             height = self.wbcd_height
             mode_to_send = LocomotionMode.IDLE_SQUAT
+
+        elif self.wbcd_mode == WBCDCompetitionMode.KNEEL_MANIP:
+            min_height = self._cfg_float("height", "kneel_min", default=0.30)
+            max_height = self._cfg_float("height", "kneel_max", default=0.70)
+            self.wbcd_height = clamp(self.wbcd_height, min_height, max_height)
+            height = self.wbcd_height
+            mode_to_send = LocomotionMode.IDLE_KNEEL_TWO_LEGS
+            movement = [0.0, 0.0, 0.0]
+            speed = -1.0
 
         elif self.wbcd_mode == WBCDCompetitionMode.STAND_RECOVERY:
             target = self._cfg_float("height", "stand_recovery_target", default=0.74)
@@ -2259,6 +2278,7 @@ def run_pico_manager(
         prev_left_axis_click = False
         prev_wbcd_stand = False
         prev_wbcd_half_squat = False
+        prev_wbcd_kneel = False
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
@@ -2287,6 +2307,13 @@ def run_pico_manager(
                 x_pressed,
                 y_pressed,
             )
+            wbcd_kneel_pressed = wbcd_enabled and left_menu_button and _face_button_pressed(
+                planner_streamer.wbcd_config.get_str("buttons", "kneel_manip", default="Y"),
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+            )
             wbcd_recovery_pressed = wbcd_enabled and left_menu_button and _face_button_pressed(
                 planner_streamer.wbcd_config.get_str("buttons", "hold_stand_recovery", default="B"),
                 a_pressed,
@@ -2308,6 +2335,15 @@ def run_pico_manager(
                     planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_MANIP)
                 elif wbcd_half_squat_pressed and not prev_wbcd_half_squat:
                     planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
+                elif wbcd_kneel_pressed and not prev_wbcd_kneel:
+                    if current_wbcd_mode in (
+                        WBCDCompetitionMode.STAND_MANIP,
+                        WBCDCompetitionMode.HALF_SQUAT_MANIP,
+                        WBCDCompetitionMode.KNEEL_MANIP,
+                    ):
+                        planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.KNEEL_MANIP)
+                    else:
+                        print("[WBCD] Enter HALF_SQUAT_MANIP before KNEEL_MANIP")
                 elif current_wbcd_mode != WBCDCompetitionMode.STAND_RECOVERY:
                     if wbcd_recovery_pressed:
                         planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.STAND_RECOVERY)
@@ -2331,6 +2367,7 @@ def run_pico_manager(
                     prev_left_axis_click = left_axis_click
                     prev_wbcd_stand = wbcd_stand_pressed
                     prev_wbcd_half_squat = wbcd_half_squat_pressed
+                    prev_wbcd_kneel = wbcd_kneel_pressed
                     continue
                 if by_pressed and not prev_by_pressed:
                     planner_streamer.clear_wbcd_mode()
@@ -2344,6 +2381,7 @@ def run_pico_manager(
                     prev_left_axis_click = left_axis_click
                     prev_wbcd_stand = wbcd_stand_pressed
                     prev_wbcd_half_squat = wbcd_half_squat_pressed
+                    prev_wbcd_kneel = wbcd_kneel_pressed
                     continue
                 else:
                     new_mode = StreamMode.PLANNER_VR_3PT
@@ -2359,6 +2397,7 @@ def run_pico_manager(
                         prev_left_axis_click = left_axis_click
                         prev_wbcd_stand = wbcd_stand_pressed
                         prev_wbcd_half_squat = wbcd_half_squat_pressed
+                        prev_wbcd_kneel = wbcd_kneel_pressed
                         continue
 
                     socket.send(
@@ -2377,6 +2416,7 @@ def run_pico_manager(
                     prev_left_axis_click = left_axis_click
                     prev_wbcd_stand = wbcd_stand_pressed
                     prev_wbcd_half_squat = wbcd_half_squat_pressed
+                    prev_wbcd_kneel = wbcd_kneel_pressed
                     continue
 
             new_mode = current_mode
@@ -2409,6 +2449,8 @@ def run_pico_manager(
                 elif wbcd_half_squat_pressed and not prev_wbcd_half_squat:
                     new_mode = StreamMode.PLANNER_VR_3PT
                     planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
+                elif wbcd_kneel_pressed and not prev_wbcd_kneel:
+                    print("[WBCD] Enter HALF_SQUAT_MANIP before KNEEL_MANIP")
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
@@ -2530,6 +2572,7 @@ def run_pico_manager(
             prev_left_axis_click = left_axis_click
             prev_wbcd_stand = wbcd_stand_pressed
             prev_wbcd_half_squat = wbcd_half_squat_pressed
+            prev_wbcd_kneel = wbcd_kneel_pressed
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
