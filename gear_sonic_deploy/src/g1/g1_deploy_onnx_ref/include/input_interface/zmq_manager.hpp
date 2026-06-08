@@ -266,6 +266,8 @@ class ZMQManager : public InputInterface {
             } else if (new_mode == ManagedMode::STREAMED_MOTION) {
               std::cout << "[ZMQManager] Switched to: STREAMED MOTION mode (safety reset)" << std::endl;
               trigger_zmq_toggle = true;
+              has_vr_3point_control_ = false;
+              last_has_vr_3point_control_ = false;
 
               // Clear planner buffer when switching away from planner mode
               {

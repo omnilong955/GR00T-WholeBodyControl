@@ -1906,14 +1906,14 @@ class PlannerStreamer:
         return [movement_global[0], movement_global[1], 0.0], facing, speed, LocomotionMode.SLOW_WALK
 
     def _collect_vr3pt_targets(self):
-        vr_3pt_position = None
-        vr_3pt_orientation = None
         sample = self.reader.get_latest()
-        if sample is not None:
-            print("[PlannerLoop] Sending VR 3-point pose as target")
-            vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-            vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
-            vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+        if sample is None:
+            return None
+
+        print("[PlannerLoop] Sending VR 3-point pose as target")
+        vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+        vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
+        vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
         (
             _left_menu_button,
@@ -1987,12 +1987,15 @@ class PlannerStreamer:
             max_wz = self._cfg_float("movement", "stand_recovery_max_wz", default=0.25)
             movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
 
+        vr_targets = self._collect_vr3pt_targets()
+        if vr_targets is None:
+            return
         (
             vr_3pt_position,
             vr_3pt_orientation,
             left_hand_position,
             right_hand_position,
-        ) = self._collect_vr3pt_targets()
+        ) = vr_targets
 
         msg = build_planner_message(
             mode_to_send.value,
