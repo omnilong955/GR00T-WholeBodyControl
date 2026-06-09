@@ -42,7 +42,7 @@ entry:
   squat_enter_speed_mps: 0.08
 
   # Print per-frame VR target positions for debugging only.
-  print_vr_target_debug: true
+  print_vr_target_debug: false
 
 recovery:
   # KNEEL_MANIP recovery sequence while holding left_menu+B:
