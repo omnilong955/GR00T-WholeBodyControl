@@ -696,10 +696,16 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
     thumb = 0
     middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
+    # Keep thumb open and drive a stable three-stage middle-finger grip:
+    # open -> quarter grip -> full grip.
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    if trigger < 0.3:
+        grip_amount = 0.0
+    elif trigger < 0.7:
+        grip_amount = 0.25
+    else:
+        grip_amount = 1.0
+    fingertips[4 + middle, 0, 3] = grip_amount
 
     return fingertips
 
@@ -1893,6 +1899,10 @@ class PlannerStreamer:
         self._prev_wbcd_height_down = False
         self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
         self._kneel_recovery_stage_elapsed = 0.0
+        self._wbcd_pose_recovery = False
+        self._wbcd_recovery_upper_body_position = None
+        self._wbcd_recovery_left_hand_position = None
+        self._wbcd_recovery_right_hand_position = None
         self.wbcd_torso_pitch_deg = self._cfg_float(
             "torso", "default_pitch_deg", default=0.0
         )
@@ -2125,6 +2135,10 @@ class PlannerStreamer:
             self._prev_wbcd_height_down = False
             self._kneel_recovery_stage = WBCDKneelRecoveryStage.NONE
             self._kneel_recovery_stage_elapsed = 0.0
+            self._wbcd_pose_recovery = False
+            self._wbcd_recovery_upper_body_position = None
+            self._wbcd_recovery_left_hand_position = None
+            self._wbcd_recovery_right_hand_position = None
             self._reset_wbcd_torso_pitch()
             if self._cfg_bool("logging", "print_mode_changes", default=True):
                 print("[WBCD] Mode -> TRANSPORT")
@@ -2135,6 +2149,7 @@ class PlannerStreamer:
     def start_kneel_recovery(self):
         self.wbcd_mode = WBCDCompetitionMode.STAND_RECOVERY
         self.wbcd_recovery_hold = True
+        self._wbcd_pose_recovery = False
         self._wbcd_return_to_pose = False
         self._wbcd_entry_hold_until = 0.0
         self._kneel_recovery_stage = WBCDKneelRecoveryStage.KNEEL_HOLD
@@ -2145,6 +2160,29 @@ class PlannerStreamer:
                 "[WBCD] Mode -> STAND_RECOVERY, "
                 f"kneel_stage={self._kneel_recovery_stage.name}, height={self.wbcd_height:.3f}"
             )
+
+    def start_pose_kneel_recovery(self) -> bool:
+        self.feedback_reader.poll_feedback()
+        if self.feedback_reader.full_body_q_measured is None:
+            if self._cfg_bool("entry", "require_robot_feedback", default=True):
+                print("[WBCD] Cannot start POSE kneel recovery: no robot feedback")
+                return False
+
+        self._wbcd_recovery_upper_body_position = self.feedback_reader.upper_body_position_target
+        self._wbcd_recovery_left_hand_position = self.feedback_reader.left_hand_position_target
+        self._wbcd_recovery_right_hand_position = self.feedback_reader.right_hand_position_target
+        if (
+            self._wbcd_recovery_upper_body_position is None
+            and self._cfg_bool("entry", "require_robot_feedback", default=True)
+        ):
+            print("[WBCD] Cannot start POSE kneel recovery: no upper body feedback target")
+            return False
+        self.wbcd_height = self._cfg_float("height", "kneel_default", default=0.30)
+        self._wbcd_pose_recovery = True
+        self.start_kneel_recovery()
+        self._wbcd_pose_recovery = True
+        print("[WBCD] POSE kneel recovery started with frozen upper body targets")
+        return True
 
     def consume_wbcd_return_to_pose(self) -> bool:
         value = self._wbcd_return_to_pose
@@ -2404,15 +2442,21 @@ class PlannerStreamer:
                 max_wz = self._cfg_float("movement", "stand_recovery_max_wz", default=0.25)
                 movement, facing, speed, mode_to_send = self._compute_wbcd_movement(max_vx, max_wz)
 
-        vr_targets = self._collect_vr3pt_targets()
-        if vr_targets is None:
-            return
-        (
-            vr_3pt_position,
-            vr_3pt_orientation,
-            left_hand_position,
-            right_hand_position,
-        ) = vr_targets
+        if self._wbcd_pose_recovery:
+            vr_3pt_position = None
+            vr_3pt_orientation = None
+            left_hand_position = self._wbcd_recovery_left_hand_position
+            right_hand_position = self._wbcd_recovery_right_hand_position
+        else:
+            vr_targets = self._collect_vr3pt_targets()
+            if vr_targets is None:
+                return
+            (
+                vr_3pt_position,
+                vr_3pt_orientation,
+                left_hand_position,
+                right_hand_position,
+            ) = vr_targets
         if self._cfg_bool("entry", "print_vr_target_debug", default=False):
             print(
                 "[WBCD] VR targets "
@@ -2420,7 +2464,11 @@ class PlannerStreamer:
                 f"T={vr_3pt_position[6:9]}, "
                 f"height={height:.3f}, mode={mode_to_send.name}"
             )
-        upper_body_position = self._build_wbcd_upper_body_position()
+        upper_body_position = (
+            self._wbcd_recovery_upper_body_position
+            if self._wbcd_pose_recovery
+            else self._build_wbcd_upper_body_position()
+        )
 
         msg = build_planner_message(
             mode_to_send.value,
@@ -2797,9 +2845,9 @@ def run_pico_manager(
                     planner_streamer.run_once(new_mode)
                     if planner_streamer.consume_wbcd_return_to_pose():
                         planner_streamer.clear_wbcd_mode()
-                        socket.send(build_command_message(start=True, stop=False, planner=False))
-                        print("[Manager] StreamMode switch: PLANNER_VR_3PT -> POSE")
-                        current_mode = StreamMode.POSE
+                        socket.send(build_command_message(start=True, stop=False, planner=True))
+                        print("[Manager] StreamMode switch: PLANNER_VR_3PT -> PLANNER")
+                        current_mode = StreamMode.PLANNER
                         prev_ax_pressed = ax_pressed
                         prev_by_pressed = by_pressed
                         prev_start_combo = start_combo
@@ -2864,6 +2912,9 @@ def run_pico_manager(
                         planner_streamer.enter_wbcd_mode(WBCDCompetitionMode.HALF_SQUAT_MANIP)
                 elif wbcd_kneel_pressed and not prev_wbcd_kneel:
                     print("[WBCD] Enter HALF_SQUAT_MANIP before KNEEL_MANIP")
+                elif wbcd_recovery_pressed:
+                    if planner_streamer.start_pose_kneel_recovery():
+                        new_mode = StreamMode.PLANNER_VR_3PT
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
