@@ -699,10 +699,10 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     # Keep thumb open and drive a stable three-stage middle-finger grip:
     # open -> quarter grip -> full grip.
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger < 0.3:
+    if trigger < 0.2:
         grip_amount = 0.0
-    elif trigger < 0.7:
-        grip_amount = 0.25
+    elif trigger < 0.8:
+        grip_amount = 0.40
     else:
         grip_amount = 1.0
     fingertips[4 + middle, 0, 3] = grip_amount
