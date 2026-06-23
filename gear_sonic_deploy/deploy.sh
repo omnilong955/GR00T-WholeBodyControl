@@ -211,6 +211,11 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --use-inspire-bridge    Enable Inspire TCP bridge output (disable Dex3 output)"
+    echo "  --inspire-host HOST     Inspire bridge server host (default: 127.0.0.1)"
+    echo "  --inspire-port PORT     Inspire bridge server port (default: 18080)"
+    echo "  --inspire-close-threshold V  Binary threshold [0,1] (default: 0.5)"
+    echo "  --inspire-rate-hz HZ    Inspire resend rate in Hz (default: 20)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -242,6 +247,11 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+USE_INSPIRE_BRIDGE_DEFAULT="false"
+INSPIRE_HOST_DEFAULT="127.0.0.1"
+INSPIRE_PORT_DEFAULT="18080"
+INSPIRE_CLOSE_THRESHOLD_DEFAULT="0.5"
+INSPIRE_RATE_HZ_DEFAULT="20"
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -251,6 +261,11 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+USE_INSPIRE_BRIDGE="$USE_INSPIRE_BRIDGE_DEFAULT"
+INSPIRE_HOST="$INSPIRE_HOST_DEFAULT"
+INSPIRE_PORT="$INSPIRE_PORT_DEFAULT"
+INSPIRE_CLOSE_THRESHOLD="$INSPIRE_CLOSE_THRESHOLD_DEFAULT"
+INSPIRE_RATE_HZ="$INSPIRE_RATE_HZ_DEFAULT"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -313,6 +328,42 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ZMQ_HOST="$2"
+            shift 2
+            ;;
+        --use-inspire-bridge)
+            USE_INSPIRE_BRIDGE="true"
+            shift
+            ;;
+        --inspire-host)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --inspire-host requires a host argument${NC}" >&2
+                exit 1
+            fi
+            INSPIRE_HOST="$2"
+            shift 2
+            ;;
+        --inspire-port)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --inspire-port requires a port argument${NC}" >&2
+                exit 1
+            fi
+            INSPIRE_PORT="$2"
+            shift 2
+            ;;
+        --inspire-close-threshold)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --inspire-close-threshold requires a value argument${NC}" >&2
+                exit 1
+            fi
+            INSPIRE_CLOSE_THRESHOLD="$2"
+            shift 2
+            ;;
+        --inspire-rate-hz)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --inspire-rate-hz requires a value argument${NC}" >&2
+                exit 1
+            fi
+            INSPIRE_RATE_HZ="$2"
             shift 2
             ;;
         sim|real)
@@ -386,6 +437,12 @@ if [[ "$ENV_TYPE" == "sim" ]]; then
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
 fi
+
+if [[ "$USE_INSPIRE_BRIDGE" == "true" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --use-inspire-bridge --inspire-host $INSPIRE_HOST --inspire-port $INSPIRE_PORT --inspire-close-threshold $INSPIRE_CLOSE_THRESHOLD --inspire-rate-hz $INSPIRE_RATE_HZ"
+fi
+
+EXTRA_ARGS="$(echo "$EXTRA_ARGS" | xargs)"
 
 # ============================================================================
 # Step 1: Check Prerequisites
@@ -515,6 +572,13 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  Inspire Bridge:     ${GREEN}$USE_INSPIRE_BRIDGE${NC}"
+if [[ "$USE_INSPIRE_BRIDGE" == "true" ]]; then
+    echo -e "  Inspire Host:       ${GREEN}$INSPIRE_HOST${NC}"
+    echo -e "  Inspire Port:       ${GREEN}$INSPIRE_PORT${NC}"
+    echo -e "  Inspire Threshold:  ${GREEN}$INSPIRE_CLOSE_THRESHOLD${NC}"
+    echo -e "  Inspire Rate Hz:    ${GREEN}$INSPIRE_RATE_HZ${NC}"
+fi
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi

@@ -65,6 +65,17 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <string>
+#include <cerrno>
+#include <utility>
+#include <iomanip>
+#include <sstream>
+#include <optional>
+
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -142,6 +153,129 @@
 using namespace unitree::common;
 using namespace unitree::robot;
 using namespace unitree_hg::msg::dds_;
+
+
+class InspireBridgeClient {
+  public:
+    InspireBridgeClient(std::string host, int port, int timeout_ms = 30)
+      : host_(std::move(host)), port_(port), timeout_ms_(timeout_ms) {}
+
+    ~InspireBridgeClient() { Close(); }
+
+    bool SendSet(int left, int right) {
+      left = (left != 0) ? 1 : 0;
+      right = (right != 0) ? 1 : 0;
+
+      if (!ConnectIfNeeded()) {
+        return false;
+      }
+
+      const std::string cmd = "SET " + std::to_string(left) + " " + std::to_string(right) + "\n";
+      if (!SendAll(cmd)) {
+        Close();
+        return false;
+      }
+
+      std::string response;
+      if (!ReadLine(response)) {
+        Close();
+        return false;
+      }
+      return response.rfind("OK", 0) == 0;
+    }
+
+    void Close() {
+      if (sock_fd_ >= 0) {
+        ::close(sock_fd_);
+        sock_fd_ = -1;
+      }
+    }
+
+  private:
+    bool ConnectIfNeeded() {
+      if (sock_fd_ >= 0) {
+        return true;
+      }
+
+      struct addrinfo hints {};
+      hints.ai_family = AF_UNSPEC;
+      hints.ai_socktype = SOCK_STREAM;
+      hints.ai_protocol = IPPROTO_TCP;
+
+      struct addrinfo* result = nullptr;
+      const std::string port_str = std::to_string(port_);
+      const int gai_rc = ::getaddrinfo(host_.c_str(), port_str.c_str(), &hints, &result);
+      if (gai_rc != 0 || result == nullptr) {
+        return false;
+      }
+
+      for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+        int fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+          continue;
+        }
+
+        struct timeval tv {};
+        tv.tv_sec = timeout_ms_ / 1000;
+        tv.tv_usec = (timeout_ms_ % 1000) * 1000;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+          sock_fd_ = fd;
+          std::string banner;
+          (void)ReadLine(banner);
+          break;
+        }
+
+        ::close(fd);
+      }
+
+      ::freeaddrinfo(result);
+      return sock_fd_ >= 0;
+    }
+
+    bool SendAll(const std::string& msg) {
+      size_t total_sent = 0;
+      while (total_sent < msg.size()) {
+        const ssize_t n = ::send(sock_fd_, msg.data() + total_sent, msg.size() - total_sent, 0);
+        if (n > 0) {
+          total_sent += static_cast<size_t>(n);
+          continue;
+        }
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        return false;
+      }
+      return true;
+    }
+
+    bool ReadLine(std::string& out) {
+      out.clear();
+      char ch = '\0';
+      while (out.size() < 256) {
+        const ssize_t n = ::recv(sock_fd_, &ch, 1, 0);
+        if (n == 1) {
+          if (ch == '\n') {
+            return true;
+          }
+          out.push_back(ch);
+          continue;
+        }
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        return false;
+      }
+      return false;
+    }
+
+    std::string host_;
+    int port_ = 18080;
+    int timeout_ms_ = 30;
+    int sock_fd_ = -1;
+};
 
 
 
@@ -280,6 +414,17 @@ class G1Deploy {
     
     // Dex3 hands manager
     Dex3Hands dex3_hands_;
+    bool use_inspire_bridge_ = false;
+    std::string inspire_host_ = "127.0.0.1";
+    int inspire_port_ = 18080;
+    double inspire_close_threshold_ = 0.5;
+    double inspire_send_period_s_ = 0.05;
+    std::unique_ptr<InspireBridgeClient> inspire_bridge_;
+    bool inspire_has_last_cmd_ = false;
+    int inspire_last_left_cmd_ = 0;
+    int inspire_last_right_cmd_ = 0;
+    std::chrono::steady_clock::time_point inspire_last_send_time_{};
+    int inspire_send_fail_count_ = 0;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -405,6 +550,66 @@ class G1Deploy {
 
     // VR5Point index
     std::array<int, 5> actual_vr_5point_index = {-1, -1, -1, -1, -1};
+
+    static std::array<double, 7> GetClosedHandReference(bool is_left) {
+      if (is_left) {
+        return {0.0, 0.0, 1.75, -1.57, -1.75, -1.57, -1.75};
+      }
+      return {0.0, 0.0, -1.75, 1.57, 1.75, 1.57, 1.75};
+    }
+
+    double EstimateCloseRatio(const std::array<double, 7>& hand_joints, bool is_left) const {
+      const auto closed_ref = GetClosedHandReference(is_left);
+      double denom = 0.0;
+      double numer = 0.0;
+      for (int i = 0; i < 7; ++i) {
+        denom += std::abs(closed_ref[i]);
+        numer += std::abs(hand_joints[i]);
+      }
+      if (denom < 1e-6) {
+        return 0.0;
+      }
+      return std::clamp(numer / denom, 0.0, 1.0);
+    }
+
+    int HandJointToBinary(const std::array<double, 7>& hand_joints, bool is_left, bool has_hand_data) const {
+      if (!has_hand_data) {
+        return 0;
+      }
+      const double close_ratio = EstimateCloseRatio(hand_joints, is_left);
+      return (close_ratio >= inspire_close_threshold_) ? 1 : 0;
+    }
+
+    bool MaybeSendInspireBinary(int left, int right, bool force = false) {
+      if (!use_inspire_bridge_ || !inspire_bridge_) {
+        return true;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      const bool changed = (!inspire_has_last_cmd_) || (left != inspire_last_left_cmd_) || (right != inspire_last_right_cmd_);
+      const bool periodic_due = (inspire_last_send_time_.time_since_epoch().count() == 0) ||
+                                (std::chrono::duration<double>(now - inspire_last_send_time_).count() >= inspire_send_period_s_);
+      if (!force && !changed && !periodic_due) {
+        return true;
+      }
+
+      const bool ok = inspire_bridge_->SendSet(left, right);
+      if (ok) {
+        inspire_has_last_cmd_ = true;
+        inspire_last_left_cmd_ = left;
+        inspire_last_right_cmd_ = right;
+        inspire_last_send_time_ = now;
+        inspire_send_fail_count_ = 0;
+      } else {
+        inspire_send_fail_count_++;
+        if (inspire_send_fail_count_ == 1 || inspire_send_fail_count_ % 50 == 0) {
+          std::cerr << "[WARN] Failed to send Inspire command to "
+                    << inspire_host_ << ":" << inspire_port_
+                    << " (fail_count=" << inspire_send_fail_count_ << ")" << std::endl;
+        }
+      }
+      return ok;
+    }
 
     // =========================================================================
     // Motion-based observation gatherers
@@ -2156,7 +2361,12 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool use_inspire_bridge = false,
+      std::string inspire_host = "127.0.0.1",
+      int inspire_port = 18080,
+      double inspire_close_threshold = 0.5,
+      double inspire_rate_hz = 20.0)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2174,6 +2384,11 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        use_inspire_bridge_(use_inspire_bridge),
+        inspire_host_(inspire_host),
+        inspire_port_(inspire_port),
+        inspire_close_threshold_(inspire_close_threshold),
+        inspire_send_period_s_(inspire_rate_hz > 1e-3 ? (1.0 / inspire_rate_hz) : 0.05),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2181,8 +2396,15 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      if (!use_inspire_bridge_) {
+        dex3_hands_.initialize("");
+      } else {
+        inspire_bridge_ = std::make_unique<InspireBridgeClient>(inspire_host_, inspire_port_);
+        std::cout << "[INFO] Inspire bridge enabled: " << inspire_host_ << ":" << inspire_port_
+                  << " | close_threshold=" << inspire_close_threshold_
+                  << " | send_rate_hz=" << (1.0 / inspire_send_period_s_) << std::endl;
+        MaybeSendInspireBinary(0, 0, true);
+      }
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2515,7 +2737,9 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        if (!use_inspire_bridge_) {
+          dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        }
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -2675,8 +2899,10 @@ class G1Deploy {
         lowcmd_publisher_->Write(dds_low_command);
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      if (!use_inspire_bridge_) {
+        // Publish Dex3 hand commands at the same publish cadence.
+        dex3_hands_.writeOnce();
+      }
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -2693,6 +2919,12 @@ class G1Deploy {
         if (planner_thread_ptr_) {
           planner_thread_ptr_->Wait();
           planner_thread_ptr_.reset();
+        }
+      }
+      if (use_inspire_bridge_) {
+        MaybeSendInspireBinary(0, 0, true);
+        if (inspire_bridge_) {
+          inspire_bridge_->Close();
         }
       }
       CreateDampingCommand();
@@ -2745,12 +2977,20 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        if (!use_inspire_bridge_) {
+          dex3_hands_.close(true);
+          dex3_hands_.close(false);
+        } else {
+          MaybeSendInspireBinary(1, 1);
+        }
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        if (!use_inspire_bridge_) {
+          dex3_hands_.open(true);
+          dex3_hands_.open(false);
+        } else {
+          MaybeSendInspireBinary(0, 0, true);
+        }
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -2903,19 +3143,21 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
-      if (left_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
-          left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+      if (!use_inspire_bridge_) {
+        auto left_hand_state_ptr = dex3_hands_.getState(true);
+        if (left_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
+            left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+          }
         }
-      }
-      
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
-      if (right_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
-          right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+
+        auto right_hand_state_ptr = dex3_hands_.getState(false);
+        if (right_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
+            right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+          }
         }
       }
 
@@ -3814,6 +4056,9 @@ class G1Deploy {
             operator_state.stop = true;
             break;
           }
+          if (use_inspire_bridge_) {
+            MaybeSendInspireBinary(0, 0);
+          }
 
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
@@ -3947,12 +4192,15 @@ class G1Deploy {
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
-          
-          // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          if (!use_inspire_bridge_) {
+            dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+            dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          } else {
+            const int left_binary = HandJointToBinary(left_hand_joint_buffer_, true, has_left_hand_data_);
+            const int right_binary = HandJointToBinary(right_hand_joint_buffer_, false, has_right_hand_data_);
+            MaybeSendInspireBinary(left_binary, right_binary);
+          }
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {
@@ -4068,8 +4316,11 @@ class G1Deploy {
                         << vr_3point_compliance_buffer_[2] << "]";
             }
             
-            // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            if (!use_inspire_bridge_) {
+              std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            } else {
+              std::cout << " | InspireBridge: " << inspire_host_ << ":" << inspire_port_;
+            }
             
             std::cout << std::endl;
           }
@@ -4134,6 +4385,11 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --use-inspire-bridge: replace Dex3 output with Inspire TCP bridge output" << std::endl;
+    std::cout << "  --inspire-host <host>: Inspire bridge server host (default: 127.0.0.1)" << std::endl;
+    std::cout << "  --inspire-port <port>: Inspire bridge server port (default: 18080)" << std::endl;
+    std::cout << "  --inspire-close-threshold <v>: binary threshold for close ratio [0,1] (default: 0.5)" << std::endl;
+    std::cout << "  --inspire-rate-hz <hz>: command resend rate to satisfy watchdog (default: 20)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4177,6 +4433,11 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool useInspireBridge = false;
+  std::string inspireHost = "127.0.0.1";
+  int inspirePort = 18080;
+  double inspireCloseThreshold = 0.5;
+  double inspireRateHz = 20.0;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4406,6 +4667,53 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--use-inspire-bridge") {
+      useInspireBridge = true;
+      std::cout << "[INFO] Inspire bridge output enabled (Dex3 output disabled)" << std::endl;
+    } else if (std::string(argv[i]) == "--inspire-host") {
+      if (i + 1 < argc) {
+        inspireHost = argv[i + 1];
+        std::cout << "[INFO] Inspire host: " << inspireHost << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --inspire-host requires a host argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--inspire-port") {
+      if (i + 1 < argc) {
+        inspirePort = std::stoi(argv[i + 1]);
+        std::cout << "[INFO] Inspire port: " << inspirePort << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --inspire-port requires a port argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--inspire-close-threshold") {
+      if (i + 1 < argc) {
+        inspireCloseThreshold = std::stod(argv[i + 1]);
+        if (inspireCloseThreshold < 0.0 || inspireCloseThreshold > 1.0) {
+          std::cerr << "Error: --inspire-close-threshold must be within [0, 1]" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Inspire close threshold: " << inspireCloseThreshold << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --inspire-close-threshold requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--inspire-rate-hz") {
+      if (i + 1 < argc) {
+        inspireRateHz = std::stod(argv[i + 1]);
+        if (inspireRateHz <= 0.0) {
+          std::cerr << "Error: --inspire-rate-hz must be > 0" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Inspire send rate: " << inspireRateHz << " Hz" << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --inspire-rate-hz requires a value argument" << std::endl;
+        exit(1);
+      }
     }
   }
 
@@ -4438,7 +4746,12 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    useInspireBridge,
+    inspireHost,
+    inspirePort,
+    inspireCloseThreshold,
+    inspireRateHz
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4465,4 +4778,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-
